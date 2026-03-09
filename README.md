@@ -12,19 +12,27 @@ Paper: https://arxiv.org/abs/2512.05790
 
 ## Overview
 
-This repository contains the code used to generate the experiments reported in the paper.
-The work introduces the *learnability window* $H_N$, the set of temporal lags
-at which a finite training budget $N$ can reliably learn long-range dependencies
-in a gated RNN. The analysis rests on a matched-statistic decomposition that
-factorises each lag's gradient signal into a memory-kernel envelope $\mu(\ell)$,
-a parameter-sensitivity term (JVP), and a heavy-tailed residual whose tail index
-$\hat\alpha(\ell)$ governs sample complexity. Five gated architectures are
-compared: ConstGate, SharedGate, DiagGate, GRU, and LSTM.
+This repository contains the code for the experiments reported in the paper.
 
-The pipeline trains each architecture on a synthetic multi-lag regression task
-($y_t = \sum_k c_k\, u^\top x_{t-\ell_k} + \text{noise}$), runs the full
-diagnostic suite (memory kernel, tail-index estimation, SNR, sample complexity),
-and produces all figures in the paper.
+Classical analyses of gated RNNs focus on the numerical stability of Jacobian
+products, but stability alone does not guarantee that gradient signals are
+statistically recoverable from finite data. This work introduces the
+*learnability window* $\mathcal{H}_N$, defined as the maximal temporal horizon
+over which gradient information remains detectable at sample size $N$.
+Learnability is governed by the interaction between two quantities: the decay
+geometry of the effective learning rate envelope
+$f(\ell) = \lVert\mu_{t,\ell}\rVert_1$, derived from first-order expansions of
+gate-induced Jacobians in BPTT, and the concentration rate
+$N^{-1/\kappa_\alpha}$ of stochastic gradients under heavy-tailed
+($\alpha$-stable) noise. This interaction yields explicit scaling laws —
+logarithmic, polynomial, and exponential growth of $\mathcal{H}_N$ — that
+classify temporal learning regimes according to the attenuation of $f(\ell)$.
+Five gated architectures are compared empirically: ConstGate, SharedGate,
+DiagGate, GRU, and LSTM.
+
+The pipeline trains each architecture on a synthetic multi-lag regression task,
+runs the full diagnostic suite (memory-kernel envelope, tail-index estimation,
+SNR, sample complexity), and produces all figures in the paper.
 
 ---
 
