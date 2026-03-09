@@ -17,15 +17,15 @@ This repository contains the code for the experiments reported in the paper.
 Classical analyses of gated RNNs focus on the numerical stability of Jacobian
 products, but stability alone does not guarantee that gradient signals are
 statistically recoverable from finite data. This work introduces the
-*learnability window* $\mathcal{H}_N$, defined as the maximal temporal horizon
+*learnability window* $\mathcal{H}\_N$, defined as the maximal temporal horizon
 over which gradient information remains detectable at sample size $N$.
 Learnability is governed by the interaction between two quantities: the decay
 geometry of the effective learning rate envelope
-$f(\ell) = \lVert\mu_{t,\ell}\rVert_1$, derived from first-order expansions of
+$f(\ell) = \lVert \mu\_{t,\ell} \rVert\_1$, derived from first-order expansions of
 gate-induced Jacobians in BPTT, and the concentration rate
-$N^{-1/\kappa_\alpha}$ of stochastic gradients under heavy-tailed
-($\alpha$-stable) noise. This interaction yields explicit scaling laws —
-logarithmic, polynomial, and exponential growth of $\mathcal{H}_N$ — that
+$N^{-1/\kappa\_\alpha}$ of stochastic gradients under heavy-tailed
+( $\alpha$-stable) noise. This interaction yields explicit scaling laws —
+logarithmic, polynomial, and exponential growth of $\mathcal{H}\_N$ — that
 classify temporal learning regimes according to the attenuation of $f(\ell)$.
 Five gated architectures are compared empirically: ConstGate, SharedGate,
 DiagGate, GRU, and LSTM.
@@ -170,22 +170,22 @@ and additional workflow patterns.
 
 Each training run produces per-model CSV files (summary statistics, learning
 curves, per-unit envelope values, time-scale fits) and aggregate files
-(learnability window $H_N$, CLI arguments for reproducibility). The plotting
+(learnability window $\mathcal{H}\_N$, CLI arguments for reproducibility). The plotting
 scripts produce PNG figures at 300 dpi.
 
 ---
 
 ## Tail-index estimation
 
-Two methods are available for estimating the stable tail index $\hat\alpha$:
+Two methods are available for estimating the stable tail index $\hat{\alpha}$:
 
 **McCulloch (1986)** (`--alpha_method mcculloch`, default): quantile-ratio
 method using four empirical quantiles. Fast but less statistically efficient.
 
 **Koutrouvelis (1980) ECF** (`--alpha_method ecf`): empirical characteristic
 function regression. For symmetric $\alpha$-stable distributions,
-$\log(-\log|\hat\varphi(t)|^2) = \log(2\sigma^\alpha) + \alpha\log|t|$;
-the slope gives $\hat\alpha$. More robust across the full $\alpha \in [1,2]$
+$\log(-\log \lvert \hat{\varphi}(t) \rvert^2) = \log(2\sigma^\alpha) + \alpha \log \lvert t \rvert$;
+the slope gives $\hat{\alpha}$. More robust across the full $\alpha \in [1,2]$
 range.
 
 Both methods include reliability guards: minimum sample count, positive scale
