@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Results (regenerate via launch_multiseed.py + plot_all_multiseed.py)
+results*/
+
+# Session handoff (LLM chat artifacts)
+SESSION_HANDOFF.md
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

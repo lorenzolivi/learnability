@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+title: "Learnability Window in Gated Recurrent Neural Networks"
+message: "If you use this code, please cite the paper."
+authors:
+  - family-names: Livi
+    given-names: Lorenzo
+date-released: 2025-12-01
+url: https://arxiv.org/abs/2512.05790
+doi: 10.48550/arXiv.2512.05790
+type: software
+license: MIT

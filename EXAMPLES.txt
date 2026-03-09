@@ -1,0 +1,500 @@
+================================================================================
+  MULTI-SEED LEARNABILITY PIPELINE — USAGE EXAMPLES
+================================================================================
+
+All scripts live in the same folder as the DGX training scripts.
+The DGX scripts (run_learnability_DGX.py and run_learnability_lstm_gru_DGX.py)
+are NOT modified — they run exactly as before. The plotting/analysis scripts
+and the launcher are new additions to the same directory.
+
+The key idea:
+  - Run training scripts with different --seed values, writing to seed-tagged
+    subdirectories:  <outdir>/seed_<S>/
+  - The plotting scripts auto-discover seed_* subdirs, aggregate across seeds,
+    and auto-merge baselines + lstm/gru results.
+
+
+================================================================================
+DIRECTORY CONVENTION
+================================================================================
+
+  results/T1024/baselines/adamw_lagmax256/
+    seed_212/
+      const/const_summary.csv
+      shared/shared_summary.csv
+      diag/diag_summary.csv
+      H_N_summary.csv
+      ...
+    seed_1001/
+      ...
+
+  results/T1024/lstm_gru/adamw_lagmax256/
+    seed_212/
+      gru/gru_summary.csv
+      lstm/lstm_summary.csv
+      H_N_summary.csv
+      ...
+    seed_1001/
+      ...
+
+Note: DGX scripts may output in nested (model-subdir) layout.
+All plotting scripts support both flat and nested layouts automatically.
+
+
+================================================================================
+1. LAUNCHING MULTI-SEED TRAINING (DGX Spark)
+================================================================================
+
+--- Full paper run (5 seeds, tmux session) ---
+
+  tmux new -s learnability
+
+  python launch_multiseed.py \
+    --seeds 212,1001,2002,3003,4004 \
+    --outdir_baselines results/T1024/baselines/adamw_lagmax256 \
+    --outdir_lstm_gru results/T1024/lstm_gru/adamw_lagmax256 \
+    --common_args "--Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
+      --optimizer adamw --momentum 0.9 --epochs 750 --batch_size 512 --lr 0.001 \
+      --weight_decay 0.0001 --grad_clip 1.0 \
+      --lag_min 4 --lag_max 256 --num_lags 128 \
+      --task_lags 32,64,128,192,256 --task_coeffs 0.6,0.5,0.4,0.32,0.26 \
+      --noise_std 0.3 \
+      --N_grid 25,50,100,150,200,300,400,600,800,1200,1600,2400,3200,4800,6400,9600,12800 \
+      --eps 0.1 --orth_init --layernorm \
+      --include_first_order_diag 1 --log_gate_stats 1 --gate_log_every 10 \
+      --device cuda \
+      --alpha_method ecf" \
+    --baseline_extra "--models const,shared,diag --const_s 0.05" \
+    --lstm_gru_extra "--models lstm,gru" \
+    --w_seed 212 \
+    --logdir logs \
+    2>&1 | tee logs/launch_multiseed.log
+
+  # Detach with: Ctrl+B, then D
+  # Reattach later with: tmux attach -t learnability
+
+  # Track progress from another terminal:
+  tail -f logs/launch_multiseed.log
+
+
+--- Same run with ECF alpha estimation ---
+
+  python launch_multiseed.py \
+    --seeds 212,1001,2002,3003,4004 \
+    --outdir_baselines results/T1024/baselines/adamw_lagmax256 \
+    --outdir_lstm_gru results/T1024/lstm_gru/adamw_lagmax256 \
+    --common_args "--Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
+      --optimizer adamw --momentum 0.9 --epochs 750 --batch_size 512 --lr 0.001 \
+      --weight_decay 0.0001 --grad_clip 1.0 \
+      --lag_min 4 --lag_max 256 --num_lags 128 \
+      --task_lags 32,64,128,192,256 --task_coeffs 0.6,0.5,0.4,0.32,0.26 \
+      --noise_std 0.3 \
+      --N_grid 25,50,100,150,200,300,400,600,800,1200,1600,2400,3200,4800,6400,9600,12800 \
+      --eps 0.1 --orth_init --layernorm \
+      --include_first_order_diag 1 --log_gate_stats 1 --gate_log_every 10 \
+      --device cuda" \
+    --baseline_extra "--models const,shared,diag --const_s 0.05" \
+    --lstm_gru_extra "--models lstm,gru" \
+    --w_seed 212 \
+    --alpha_method ecf \
+    --min_samples_alpha 500 \
+    --logdir logs \
+    2>&1 | tee logs/launch_multiseed.log
+
+
+--- Dry run (prints commands without executing) ---
+
+  python launch_multiseed.py \
+    --seeds 212,1001,2002,3003,4004 \
+    --outdir_baselines results/T1024/baselines/adamw_lagmax256 \
+    --outdir_lstm_gru results/T1024/lstm_gru/adamw_lagmax256 \
+    --common_args "--Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
+      --optimizer adamw --momentum 0.9 --epochs 750 --batch_size 512 --lr 0.001 \
+      --weight_decay 0.0001 --grad_clip 1.0 \
+      --lag_min 4 --lag_max 256 --num_lags 128 \
+      --task_lags 32,64,128,192,256 --task_coeffs 0.6,0.5,0.4,0.32,0.26 \
+      --noise_std 0.3 \
+      --N_grid 25,50,100,150,200,300,400,600,800,1200,1600,2400,3200,4800,6400,9600,12800 \
+      --eps 0.1 --orth_init --layernorm \
+      --include_first_order_diag 1 --log_gate_stats 1 --gate_log_every 10 \
+      --device cuda" \
+    --baseline_extra "--models const,shared,diag --const_s 0.05" \
+    --lstm_gru_extra "--models lstm,gru" \
+    --w_seed 212 \
+    --logdir logs \
+    --dry_run
+
+
+--- Skip baselines (only run lstm/gru) ---
+
+  python launch_multiseed.py \
+    --seeds 212,1001,2002,3003,4004 \
+    --outdir_baselines results/T1024/baselines/adamw_lagmax256 \
+    --outdir_lstm_gru results/T1024/lstm_gru/adamw_lagmax256 \
+    --common_args "..." \
+    --skip_baselines
+
+
+--- Fixed dataset, varying model init (--data_seed) ---
+
+  # Use --data_seed to fix the synthetic dataset across all seeds.
+  # Each --seed still controls model initialisation, but data generation
+  # uses --data_seed instead, isolating model randomness from data randomness.
+  #
+  # NOTE: This requires a small patch to the DGX scripts.  In both
+  # run_learnability_DGX.py and run_learnability_lstm_gru_DGX.py:
+  #   1. Add:   p.add_argument("--data_seed", type=int, default=None)
+  #   2. In the data-generation section, replace:
+  #        np.random.seed(...)  (or rely on the global seed)
+  #      with:
+  #        data_rng_seed = args.data_seed if args.data_seed is not None else args.seed
+  #        np.random.seed(data_rng_seed)
+  #   3. Then re-seed for model init:
+  #        set_seed(args.seed)
+
+  python launch_multiseed.py \
+    --seeds 212,1001,2002,3003,4004 \
+    --data_seed 42 \
+    --outdir_baselines results/T1024/baselines/adamw_lagmax256 \
+    --outdir_lstm_gru results/T1024/lstm_gru/adamw_lagmax256 \
+    --common_args "..." \
+    --w_seed 212
+
+
+--- Run DGX scripts directly (manual, per seed) ---
+
+  # Seed 212 — baselines
+  python run_learnability_DGX.py \
+    --outdir results/T1024/baselines/adamw_lagmax256/seed_212 \
+    --models const,shared,diag --const_s 0.05 \
+    --seed 212 --w_seed 212 \
+    --alpha_method ecf --min_samples_alpha 500 \
+    --Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
+    --optimizer adamw --momentum 0.9 --epochs 750 --batch_size 512 --lr 0.001 \
+    --weight_decay 0.0001 --grad_clip 1.0 \
+    --lag_min 4 --lag_max 256 --num_lags 128 \
+    --task_lags 32,64,128,192,256 --task_coeffs 0.6,0.5,0.4,0.32,0.26 \
+    --noise_std 0.3 \
+    --N_grid 25,50,100,150,200,300,400,600,800,1200,1600,2400,3200,4800,6400,9600,12800 \
+    --eps 0.1 --orth_init --layernorm --device cuda
+
+  # Seed 212 — lstm/gru
+  python run_learnability_lstm_gru_DGX.py \
+    --outdir results/T1024/lstm_gru/adamw_lagmax256/seed_212 \
+    --models lstm,gru \
+    --seed 212 --w_seed 212 \
+    --alpha_method ecf --min_samples_alpha 500 \
+    --Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
+    --optimizer adamw --momentum 0.9 --epochs 750 --batch_size 512 --lr 0.001 \
+    --weight_decay 0.0001 --grad_clip 1.0 \
+    --lag_min 4 --lag_max 256 --num_lags 128 \
+    --task_lags 32,64,128,192,256 --task_coeffs 0.6,0.5,0.4,0.32,0.26 \
+    --noise_std 0.3 \
+    --N_grid 25,50,100,150,200,300,400,600,800,1200,1600,2400,3200,4800,6400,9600,12800 \
+    --eps 0.1 --orth_init --layernorm --device cuda
+
+  # Repeat for seed_1001, seed_2002, etc.
+
+
+================================================================================
+2. PLOTTING — ALL PLOTS AT ONCE
+================================================================================
+
+  # Run all 10 plot steps in sequence:
+  python plot_all_multiseed.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256
+
+  # List available plot names:
+  python plot_all_multiseed.py --list
+
+  # Dry run (just show commands):
+  python plot_all_multiseed.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256 \
+    --dry_run
+
+  # Only run specific plots:
+  python plot_all_multiseed.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256 \
+    --only hn,envelope
+
+  # Skip specific plots:
+  python plot_all_multiseed.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256 \
+    --skip learning_curves,tau
+
+
+================================================================================
+3. PLOTTING — LEARNABILITY WINDOW (H_N curves)
+================================================================================
+
+This is the key plot that MERGES baselines + lstm/gru AND aggregates seeds.
+
+  # Multi-seed, auto-merge baselines + lstm/gru (default: mean +/- 1std):
+  python plot_empirical_learnability_win.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256
+
+  # Percentile view (median + 25th-75th shaded band):
+  python plot_empirical_learnability_win.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256 \
+    --hn_view percentile
+
+  # Custom percentile range (10th-90th):
+  python plot_empirical_learnability_win.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256 \
+    --hn_view percentile --pct_lo 10 --pct_hi 90
+
+  # Box plot (one box per model at each N):
+  python plot_empirical_learnability_win.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256 \
+    --hn_view boxplot
+
+  # Single-seed backward compatibility (works with old-style directories):
+  python plot_empirical_learnability_win.py \
+    --inputdir results/T1024/together/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256
+
+
+================================================================================
+4. PLOTTING — ENVELOPE SCALING
+================================================================================
+
+  # Multi-seed + merge:
+  python plot_envelope.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256 \
+    --show_fits 1 --save_fits 1 --fit_tempered 1
+
+  # Same as original but from single dir:
+  python plot_envelope.py \
+    --inputdir results/T1024/baselines/adamw_lagmax256 \
+    --outdir results/T1024/baselines/adamw_lagmax256
+
+  # All fit options from the original are preserved:
+  python plot_envelope.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256 \
+    --grid_mode intersection --mask_mode per_model \
+    --show_fits 1 --trim_frac 0.02 --floor_exclude_factor 10 \
+    --fit_tempered 1 --save_fits 1
+
+
+================================================================================
+5. PLOTTING — TAU DISTRIBUTIONS
+================================================================================
+
+  # Multi-seed (pools tau values across seeds):
+  python plot_tau.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256/figures
+
+  # With CCDF on log-log:
+  python plot_tau.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256/figures \
+    --ccdf --logx --logy --print_counts
+
+  # Per-model separate figures:
+  python plot_tau.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256/figures \
+    --separate
+
+
+================================================================================
+6. PLOTTING — SAMPLE COMPLEXITY SCALING (N vs envelope)
+================================================================================
+
+  python plot_N_vs_envelope.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256
+
+
+================================================================================
+7. PLOTTING — ALPHA ESTIMATION DISTRIBUTIONS
+================================================================================
+
+  # Default (KDE, reliable estimates only):
+  python plot_alpha_estimation.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256
+
+  # With histogram + KDE:
+  python plot_alpha_estimation.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256 \
+    --both
+
+  # Show unreliable estimates (gray dashed) for comparison:
+  python plot_alpha_estimation.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256 \
+    --both --show_unreliable
+
+
+================================================================================
+8. PLOTTING — NOISE FLOOR / DETECTABILITY THRESHOLD
+================================================================================
+
+  python plot_noise_floor.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256/figures \
+    --N_budgets 500,8000
+
+
+================================================================================
+9. PLOTTING — LEARNING CURVES
+================================================================================
+
+  # Note: uses --inputdirs (replaces the original --indir)
+  python plot_learnability_learning_curves.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256/plots_learning_curves
+
+  # With log-scale loss:
+  python plot_learnability_learning_curves.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256/plots_learning_curves \
+    --ylog 1
+
+
+================================================================================
+10. FITTING — MASTER PROPORTIONALITY LAW
+================================================================================
+
+  python fit_master_proportionality.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256
+
+
+================================================================================
+11. PLOTTING — APPENDIX OPTIMIZER FIGURES
+================================================================================
+
+  # For SGD:
+  python make_appendix_optimizer_figs.py \
+    --inputdirs results/T1024/baselines/sgd results/T1024/lstm_gru/sgd \
+    --outdir figs/appendix
+
+  # For momentum:
+  python make_appendix_optimizer_figs.py \
+    --inputdirs results/T1024/baselines/momentum results/T1024/lstm_gru/momentum \
+    --outdir figs/appendix
+
+
+================================================================================
+TYPICAL FULL WORKFLOW (5 seeds, AdamW, T=1024, paper params)
+================================================================================
+
+  # Step 1: Train (on DGX Spark, inside tmux)
+  tmux new -s learnability
+
+  python launch_multiseed.py \
+    --seeds 212,1001,2002,3003,4004 \
+    --outdir_baselines results/T1024/baselines/adamw_lagmax256 \
+    --outdir_lstm_gru results/T1024/lstm_gru/adamw_lagmax256 \
+    --common_args "--Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
+      --optimizer adamw --momentum 0.9 --epochs 750 --batch_size 512 --lr 0.001 \
+      --weight_decay 0.0001 --grad_clip 1.0 \
+      --lag_min 4 --lag_max 256 --num_lags 128 \
+      --task_lags 32,64,128,192,256 --task_coeffs 0.6,0.5,0.4,0.32,0.26 \
+      --noise_std 0.3 \
+      --N_grid 25,50,100,150,200,300,400,600,800,1200,1600,2400,3200,4800,6400,9600,12800 \
+      --eps 0.1 --orth_init --layernorm \
+      --include_first_order_diag 1 --log_gate_stats 1 --gate_log_every 10 \
+      --device cuda" \
+    --baseline_extra "--models const,shared,diag --const_s 0.05" \
+    --lstm_gru_extra "--models lstm,gru" \
+    --w_seed 212 \
+    --logdir logs \
+    2>&1 | tee logs/launch_multiseed.log
+
+  # Detach: Ctrl+B, D
+  # Reattach: tmux attach -t learnability
+
+  # Step 2: Plot everything (locally, after rsync from DGX)
+  python plot_all_multiseed.py \
+    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir results/T1024/together/adamw_lagmax256
+
+
+================================================================================
+ALPHA ESTIMATION METHODS
+================================================================================
+
+Two methods are available for estimating the stable tail index alpha-hat:
+
+  --alpha_method mcculloch   (default, backward compatible)
+    McCulloch (1986) quantile ratio method.
+    Uses 4 empirical quantiles (5th, 25th, 75th, 95th percentiles).
+    Fast but less efficient — throws away most of the sample information.
+    Can be unstable near alpha=2 (Gaussian limit).
+
+  --alpha_method ecf
+    Koutrouvelis (1980) Empirical Characteristic Function regression.
+    Uses the full sample via the empirical characteristic function.
+    For symmetric stable (beta=0): log(-log|phi-hat(t)|^2) = log(2*sigma^alpha) + alpha*log|t|
+    More robust across the full alpha in [1,2] range.
+    Slightly slower (O(n*K) where K=50 grid points), but subsampled for large n.
+
+Both methods output reliability flags in the summary CSV:
+  - alpha_reliable: 1 if the estimate passes quality checks, 0 otherwise
+  - alpha_method: which method was used
+  - n_samples: number of matched-statistic samples used
+
+Reliability checks (applied to both methods):
+  - Minimum sample count (default 500, adjustable via --min_samples_alpha)
+  - Positive scale estimate (sigma_hat > 0)
+  - Non-degenerate distribution (IQR > 0)
+  - Boundary estimates (alpha near 1.0 or 2.0) flagged as unreliable
+    when sample count is low
+
+The plotting script (plot_alpha_estimation.py) automatically filters
+out unreliable estimates. Use --show_unreliable to see them in gray.
+
+
+================================================================================
+BACKWARD COMPATIBILITY
+================================================================================
+
+All scripts work with old-style (single-seed, no seed_* subdirs) results too.
+
+  # If your results dir has NO seed_* subdirs, the script treats the
+  # directory itself as a single seed:
+  python plot_envelope.py \
+    --inputdir results/T1024/baselines/adamw_lagmax256 \
+    --outdir results/T1024/baselines/adamw_lagmax256
+
+  # This produces exactly the same output as the original plot_envelope.py.
+
+Summary CSVs without the new columns (alpha_reliable, alpha_method, n_samples)
+are handled gracefully — the plotting scripts fall back to basic filtering.
+
+
+================================================================================
+NOTES
+================================================================================
+
+- The DGX scripts are NOT modified structurally. They run exactly as before,
+  with the addition of --alpha_method and --min_samples_alpha flags.
+- The --w_seed is kept constant across seeds (same JVP direction).
+  This isolates the effect of training randomness (init + data).
+- 3-5 seeds are recommended. More is better but adds GPU time.
+- Plots show mean +/- 1 std as shaded bands. For single-seed, plain lines.
+- All scripts auto-detect which models are present; no need to specify.
+- The --data_seed option requires a small patch to the DGX scripts
+  (see data_seed section above for instructions). Without it, --seed controls
+  both data generation and model initialisation jointly.
+- For H_N, three views are available:
+    --hn_view mean_std    (default) mean line with +/-1std band
+    --hn_view percentile  median line with 25th-75th shaded band
+    --hn_view boxplot     box plot at each N value
+  The percentile and boxplot views are particularly useful when
+  heavy-tailed noise makes the mean/std summary less informative.
