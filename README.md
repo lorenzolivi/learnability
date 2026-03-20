@@ -20,15 +20,21 @@ statistically recoverable from finite data. This work introduces the
 *learnability window* $H\_N$, defined as the maximal temporal horizon
 over which gradient information remains detectable at sample size $N$.
 Learnability is governed by the interaction between two quantities: the decay
-geometry of the effective learning rate envelope
-$f(\ell) = \lVert \mu\_{t,\ell} \rVert\_1$, derived from first-order expansions of
-gate-induced Jacobians in BPTT, and the concentration rate
+geometry of the Generalized Effective Learning Rate (GELR) envelope
+$f(\ell) = \lVert \mu\_{t,\ell} \rVert\_1$, where each neuron's rate
+$\mu^{(q)}\_{t,\ell} = \Lambda^{(q)}\_{r,\ell}\,\Gamma^{(q)}\_{t,\ell}$
+factorizes into an adaptive optimizer base rate and a gate-induced transport
+factor derived from a first-order expansion of the recurrent Jacobian product,
+and the concentration rate
 $N^{-1/\kappa\_\alpha}$ of stochastic gradients under heavy-tailed
-($\alpha$-stable) noise. This interaction yields explicit scaling laws —
-logarithmic, polynomial, and exponential growth of $H\_N$ — that
-classify temporal learning regimes according to the attenuation of $f(\ell)$.
-Five gated architectures are compared empirically: ConstGate, SharedGate,
-DiagGate, GRU, and LSTM.
+($\alpha$-stable) noise. The empirical learnability window is formulated via
+a signal-to-noise ratio (SNR) criterion derived from the Fano bound, yielding
+explicit scaling laws — logarithmic, polynomial, and exponential growth of
+$H\_N$ — that classify temporal learning regimes according to the attenuation
+of $f(\ell)$. Five gated architectures are compared empirically: ConstGate,
+SharedGate, DiagGate, GRU, and LSTM, with optimizer adaptation
+(e.g., AdamW preconditioning) treated as a co-equal factor alongside
+architecture in shaping the envelope decay.
 
 The pipeline trains each architecture on a synthetic multi-lag regression task,
 runs the full diagnostic suite (memory-kernel envelope, tail-index estimation,
@@ -54,15 +60,19 @@ SNR, sample complexity), and produces all figures in the paper.
 ├── plot_learnability_learning_curves.py# Training loss curves
 ├── fit_master_proportionality.py       # Master proportionality law fit
 ├── make_appendix_optimizer_figs.py     # Appendix: optimizer comparison figures
+├── plot_envelope_decomposition.py     # GELR envelope decomposition: f_gates(ℓ) vs f_adapt(ℓ)
+├── launch_GELR_multiseed.sh           # Shell launcher for multi-seed GELR + decomposition runs
 ├── EXAMPLES.txt                        # Full CLI examples and workflow documentation
 ├── requirements.txt
 └── README.md
 ```
 
-The two DGX scripts implement the full training and diagnostic pipeline.
-The remaining scripts handle multi-seed orchestration and plotting with
-automatic aggregation across seeds and automatic merging of baselines and
-LSTM/GRU results.
+The two DGX scripts implement the full training and diagnostic pipeline,
+including first-order GELR envelope computation and optional envelope
+decomposition into gating ($f\_{\mathrm{gates}}$) and optimizer-adaptation
+($f\_{\mathrm{adapt}}$) components. The remaining scripts handle multi-seed
+orchestration and plotting with automatic aggregation across seeds and
+automatic merging of baselines and LSTM/GRU results.
 
 ---
 
