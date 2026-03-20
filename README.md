@@ -17,15 +17,15 @@ This repository contains the code for the experiments reported in the paper.
 Classical analyses of gated RNNs focus on the numerical stability of Jacobian
 products, but stability alone does not guarantee that gradient signals are
 statistically recoverable from finite data. This work introduces the
-*learnability window* $\mathcal{H}\_N$, defined as the maximal temporal horizon
+*learnability window* $H\_N$, defined as the maximal temporal horizon
 over which gradient information remains detectable at sample size $N$.
 Learnability is governed by the interaction between two quantities: the decay
 geometry of the effective learning rate envelope
 $f(\ell) = \lVert \mu\_{t,\ell} \rVert\_1$, derived from first-order expansions of
 gate-induced Jacobians in BPTT, and the concentration rate
 $N^{-1/\kappa\_\alpha}$ of stochastic gradients under heavy-tailed
-( $\alpha$-stable) noise. This interaction yields explicit scaling laws —
-logarithmic, polynomial, and exponential growth of $\mathcal{H}\_N$ — that
+($\alpha$-stable) noise. This interaction yields explicit scaling laws —
+logarithmic, polynomial, and exponential growth of $H\_N$ — that
 classify temporal learning regimes according to the attenuation of $f(\ell)$.
 Five gated architectures are compared empirically: ConstGate, SharedGate,
 DiagGate, GRU, and LSTM.
@@ -170,7 +170,7 @@ and additional workflow patterns.
 
 Each training run produces per-model CSV files (summary statistics, learning
 curves, per-unit envelope values, time-scale fits) and aggregate files
-(learnability window $\mathcal{H}\_N$, CLI arguments for reproducibility). The plotting
+(learnability window $H\_N$, CLI arguments for reproducibility). The plotting
 scripts produce PNG figures at 300 dpi.
 
 ---

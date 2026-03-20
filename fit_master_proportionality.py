@@ -32,6 +32,16 @@ import matplotlib.pyplot as plt
 import seed_utils
 
 CANON_MODELS = ["const", "shared", "diag", "gru", "lstm"]
+
+
+# ── Helper functions for dual-alpha format ──
+def _alpha_col(method):
+    """Return column name for alpha given method."""
+    return f"alpha_{method}"
+
+def _nreq_col(method):
+    """Return column name for N_required given method."""
+    return f"N_required_{method}"
 JSON_MODELS = {
     "const": "ConstGate",
     "shared": "SharedGate",
@@ -67,6 +77,7 @@ def parse_args():
         help="Sample complexity column in summary"
     )
     p.add_argument("--verbose", type=int, default=1)
+    seed_utils.add_view_arg(p)
     return p.parse_args()
 
 def load_json(path: str):
@@ -78,6 +89,11 @@ def get_power_window(fits_json, canon_model):
     jm = JSON_MODELS[canon_model]
     block = fits_json.get("models", {}).get(jm, {})
     power = block.get("power", None)
+
+    # Try new format: {"models": {"lstm": {"power": {...}}}} (lowercase keys)
+    if power is None:
+        block = fits_json.get("models", {}).get(canon_model, {})
+        power = block.get("power", None)
 
     # Try per-model format: {"const": {"power": {...}}} or direct {"power": {...}}
     if power is None:
@@ -107,9 +123,10 @@ def linfit(x, y):
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
     return float(a), float(b), float(r2), yhat
 
-def find_envelope_fits_json(seed_dirs, inputdirs, json_name):
+def find_envelope_fits_json(seed_dirs, inputdirs, json_name, outdir=None):
     """
     Find envelope_fits.json, supporting:
+      0. Combined file in outdir (written by plot_envelope.py in the same pipeline run)
       1. Combined file: seed_dir/envelope_fits.json (old format)
       2. Per-model files: seed_dir/<model>/<model>_envelope_fits.json (DGX nested format)
       3. Same searches in inputdirs as fallback
@@ -117,7 +134,13 @@ def find_envelope_fits_json(seed_dirs, inputdirs, json_name):
     """
     import seed_utils
 
-    # 1. Try combined file (flat or nested)
+    # 0. Try outdir first — plot_envelope.py writes the combined JSON here
+    if outdir is not None:
+        path = os.path.join(outdir, json_name)
+        if os.path.exists(path):
+            return load_json(path)
+
+    # 1. Try combined file (flat or nested) in seed dirs
     for sd in seed_dirs:
         path = seed_utils.find_file_in_seed_dir(sd, json_name)
         if path is not None:
@@ -128,10 +151,14 @@ def find_envelope_fits_json(seed_dirs, inputdirs, json_name):
         if os.path.exists(path):
             return load_json(path)
 
-    # 2. Try per-model files and reconstruct combined dict
+    # 2. Try per-model files and reconstruct combined dict.
+    #    Scan ALL seed dirs (not just the first with hits) to cover cases
+    #    where baselines/ has const/shared/diag and lstm_gru/ has gru/lstm.
     combined = {}
     for sd in seed_dirs:
         for model in CANON_MODELS:
+            if model in combined:
+                continue  # already found from an earlier seed dir
             per_model_name = f"{model}_envelope_fits.json"
             path = seed_utils.find_file_in_seed_dir(sd, per_model_name, model)
             if path is not None:
@@ -139,28 +166,40 @@ def find_envelope_fits_json(seed_dirs, inputdirs, json_name):
                     combined[model] = load_json(path)
                 except Exception:
                     pass
-        if combined:
-            # Use first seed that has any per-model files
-            return combined
 
-    if not combined:
-        raise FileNotFoundError(
-            f"Could not find {json_name} or per-model *_envelope_fits.json "
-            f"in any seed dir or input dir"
-        )
-    return combined
+    if combined:
+        return combined
 
-def load_and_aggregate_summaries(seed_dirs, model, f_col, N_col):
+    raise FileNotFoundError(
+        f"Could not find {json_name} or per-model *_envelope_fits.json "
+        f"in any seed dir, input dir, or outdir"
+    )
+
+def load_and_aggregate_summaries(seed_dirs, model, f_col, N_col, method: str = "ecf"):
     """
     Load <model>_summary.csv from each seed and aggregate on ell.
     Returns aggregated DataFrame with columns: ell, f_hat_mean, alpha_hat_mean, N_req_mean, etc.
     Also returns list of per-seed DataFrames for plotting individual points (if multi-seed).
     """
+    alpha_col = _alpha_col(method)
+    nreq_col = _nreq_col(method)
+
+    # Try new format first, fall back to old format
+    required = {f_col, alpha_col, nreq_col, "ell"}
     dfs = seed_utils.load_model_summary_across_seeds(
         seed_dirs,
         model,
-        required_cols={f_col, "alpha_hat", N_col, "ell"}
+        required_cols=required
     )
+
+    # If new format not found, try old format
+    if not dfs:
+        required = {f_col, "alpha_hat", "N_required_at_eps", "ell"}
+        dfs = seed_utils.load_model_summary_across_seeds(
+            seed_dirs,
+            model,
+            required_cols=required
+        )
 
     if not dfs:
         return None, []
@@ -168,7 +207,11 @@ def load_and_aggregate_summaries(seed_dirs, model, f_col, N_col):
     # Store per-seed data before aggregation (for individual point plotting)
     seed_dfs_subset = []
     for df in dfs:
-        d = df[["ell", f_col, "alpha_hat", N_col]].copy()
+        # Determine which columns are available
+        alpha_col_to_use = alpha_col if alpha_col in df.columns else "alpha_hat"
+        nreq_col_to_use = nreq_col if nreq_col in df.columns else "N_required_at_eps"
+
+        d = df[["ell", f_col, alpha_col_to_use, nreq_col_to_use]].copy()
         d.columns = ["ell", "f_hat", "alpha_hat", "N_req"]
         d["ell"] = pd.to_numeric(d["ell"], errors="coerce")
         d["f_hat"] = pd.to_numeric(d["f_hat"], errors="coerce")
@@ -178,10 +221,13 @@ def load_and_aggregate_summaries(seed_dirs, model, f_col, N_col):
         seed_dfs_subset.append(d)
 
     # Aggregate across seeds on 'ell'
+    alpha_col_to_use = alpha_col if alpha_col in dfs[0].columns else "alpha_hat"
+    nreq_col_to_use = nreq_col if nreq_col in dfs[0].columns else "N_required_at_eps"
+
     agg_data = seed_utils.aggregate_numeric_by_key(
         dfs,
         key_col="ell",
-        value_cols=[f_col, "alpha_hat", N_col]
+        value_cols=[f_col, alpha_col_to_use, nreq_col_to_use]
     )
 
     if agg_data.empty:
@@ -202,6 +248,7 @@ def load_and_aggregate_summaries(seed_dirs, model, f_col, N_col):
 
 def main():
     args = parse_args()
+    view = args.view
     os.makedirs(args.outdir, exist_ok=True)
 
     # Resolve input directories
@@ -212,8 +259,8 @@ def main():
     for sd in seed_dirs:
         print(f"  - {os.path.abspath(sd)}")
 
-    # Load envelope_fits.json
-    fits_json = find_envelope_fits_json(seed_dirs, inputdirs, args.json_name)
+    # Load envelope_fits.json (also check outdir, where plot_envelope.py writes it)
+    fits_json = find_envelope_fits_json(seed_dirs, inputdirs, args.json_name, outdir=args.outdir)
 
     models = (
         [m.strip() for m in args.models.split(",") if m.strip()]
@@ -223,154 +270,182 @@ def main():
 
     is_multiseed = len(seed_dirs) > 1
 
-    summary_rows = []
+    # Determine filename tag based on view mode.
+    # The master fit is inherently seed-averaged, so it maps to "aggregated".
+    # With --view both, we tag with "agg_" for consistency with other scripts.
+    tag = "agg_" if view == "both" else ""
 
+    # Detect which alpha methods are available
+    alpha_methods = ["ecf", "mcc"]  # Try both; fall back to old format if needed
+    sample_data = None
     for m in models:
-        win = get_power_window(fits_json, m)
-        if win is None:
+        agg_data, _ = load_and_aggregate_summaries(seed_dirs, m, args.f_col, args.N_col, method="ecf")
+        if agg_data is not None:
+            sample_data = agg_data
+            break
+
+    if sample_data is not None:
+        if "f_hat_mean" in sample_data.columns:
+            # Check what's available
+            if "alpha_hat_mean" in sample_data.columns and "alpha_ecf_mean" not in sample_data.columns:
+                alpha_methods = ["hat"]  # Old format
+            # else assume both ecf and mcc exist, or will handle gracefully
+
+    print(f"[info] detected alpha methods: {alpha_methods}")
+
+    for method in alpha_methods:
+        print(f"\n[processing] alpha method: {method}")
+        method_tag = f"_{method}" if len(alpha_methods) > 1 else ""
+
+        summary_rows = []
+
+        for m in models:
+            win = get_power_window(fits_json, m)
+            if win is None:
+                if args.verbose:
+                    print(f"[warn] {m}: no power window in {args.json_name}; skipping")
+                continue
+            ell_min, ell_max, beta, beta_r2 = win
+
+            # Load and aggregate summaries across seeds
+            agg_data, seed_dfs = load_and_aggregate_summaries(
+                seed_dirs, m, args.f_col, args.N_col, method=method
+            )
+
+            if agg_data is None or agg_data.empty:
+                if args.verbose:
+                    print(f"[warn] {m} ({method}): could not load/aggregate summary CSVs; skipping")
+                continue
+
             if args.verbose:
-                print(f"[warn] {m}: no power window in {args.json_name}; skipping")
-            continue
-        ell_min, ell_max, beta, beta_r2 = win
+                print(f"\n[model {m}]  power-window=[{ell_min},{ell_max}]  beta={beta:.3g} r2={beta_r2:.3g}")
 
-        # Load and aggregate summaries across seeds
-        agg_data, seed_dfs = load_and_aggregate_summaries(
-            seed_dirs, m, args.f_col, args.N_col
-        )
+            d = agg_data[["ell", "f_hat_mean", "alpha_hat_mean", "N_req_mean"]].copy()
+            d.columns = ["ell", "f_hat", "alpha_hat", "N_req"]
 
-        if agg_data is None or agg_data.empty:
-            if args.verbose:
-                print(f"[warn] {m}: could not load/aggregate summary CSVs; skipping")
-            continue
+            d["ell"] = pd.to_numeric(d["ell"], errors="coerce")
+            d["f_hat"] = pd.to_numeric(d["f_hat"], errors="coerce")
+            d["alpha_hat"] = pd.to_numeric(d["alpha_hat"], errors="coerce")
+            d["N_req"] = pd.to_numeric(d["N_req"], errors="coerce")
 
-        if args.verbose:
-            print(f"\n[model {m}]  power-window=[{ell_min},{ell_max}]  beta={beta:.3g} r2={beta_r2:.3g}")
+            # Window + validity filters
+            d = d.dropna()
+            d = d[(d["ell"] >= ell_min) & (d["ell"] <= ell_max)]
+            d = d[(d["f_hat"] > 0) & (d["alpha_hat"] > args.alpha_floor) & (d["N_req"] > 0)]
 
-        d = agg_data[["ell", "f_hat_mean", "alpha_hat_mean", "N_req_mean"]].copy()
-        d.columns = ["ell", "f_hat", "alpha_hat", "N_req"]
+            if len(d) < args.min_points:
+                if args.verbose:
+                    print(f"[warn] {m} ({method}): only {len(d)} points after filtering; skipping fit")
+                continue
 
-        d["ell"] = pd.to_numeric(d["ell"], errors="coerce")
-        d["f_hat"] = pd.to_numeric(d["f_hat"], errors="coerce")
-        d["alpha_hat"] = pd.to_numeric(d["alpha_hat"], errors="coerce")
-        d["N_req"] = pd.to_numeric(d["N_req"], errors="coerce")
+            n_unique = d["N_req"].nunique()
+            if n_unique < args.min_unique_N:
+                if args.verbose:
+                    print(
+                        f"[warn] {m} ({method}): N_req has only {n_unique} unique values in window (degenerate). Skipping fit."
+                    )
+                continue
 
-        # Window + validity filters
-        d = d.dropna()
-        d = d[(d["ell"] >= ell_min) & (d["ell"] <= ell_max)]
-        d = d[(d["f_hat"] > 0) & (d["alpha_hat"] > args.alpha_floor) & (d["N_req"] > 0)]
+            d["kappa_alpha"] = d["alpha_hat"] / (d["alpha_hat"] - 1.0)
+            d["x"] = -d["kappa_alpha"] * np.log(d["f_hat"].values)
+            d["y"] = np.log(d["N_req"].values)
 
-        if len(d) < args.min_points:
-            if args.verbose:
-                print(f"[warn] {m}: only {len(d)} points after filtering; skipping fit")
-            continue
+            a, b, r2, yhat = linfit(d["x"].values, d["y"].values)
+            d["y_hat"] = yhat
 
-        n_unique = d["N_req"].nunique()
-        if n_unique < args.min_unique_N:
+            pts_path = os.path.join(args.outdir, f"{tag}fit_master_points_{m}{method_tag}.csv")
+            d.to_csv(pts_path, index=False)
+
+            # Plot
+            plt.figure(figsize=(7, 5))
+
+            # Plot seed-averaged data
+            plt.scatter(d["x"].values, d["y"].values, s=80, alpha=0.7, zorder=3)
+
+            # If multi-seed, also plot individual seed points (lighter)
+            if is_multiseed and seed_dfs:
+                for seed_df in seed_dfs:
+                    # Apply same filters as aggregated data
+                    seed_df = seed_df.dropna()
+                    seed_df = seed_df[
+                        (seed_df["ell"] >= ell_min) & (seed_df["ell"] <= ell_max)
+                    ]
+                    seed_df = seed_df[
+                        (seed_df["f_hat"] > 0)
+                        & (seed_df["alpha_hat"] > args.alpha_floor)
+                        & (seed_df["N_req"] > 0)
+                    ]
+
+                    if len(seed_df) > 0:
+                        seed_df["kappa_alpha"] = seed_df["alpha_hat"] / (
+                            seed_df["alpha_hat"] - 1.0
+                        )
+                        seed_df["x"] = -seed_df["kappa_alpha"] * np.log(
+                            seed_df["f_hat"].values
+                        )
+                        seed_df["y"] = np.log(seed_df["N_req"].values)
+                        plt.scatter(
+                            seed_df["x"].values,
+                            seed_df["y"].values,
+                            s=20,
+                            alpha=0.15,
+                            color="C0",
+                            zorder=1
+                        )
+
+            # Fit line
+            xline = np.linspace(d["x"].min(), d["x"].max(), 200)
+            plt.plot(xline, a + b * xline, "r-", linewidth=2, zorder=2)
+
+            plt.xlabel(r"$-\kappa_{\alpha}(\ell)\,\log \hat f(\ell)$", fontsize=11)
+            plt.ylabel(r"$\log \hat N(\ell)$", fontsize=11)
+            plt.title(
+                f"{m} ({method}): slope={b:.3f}, intercept={a:.3f}, $R^2$={r2:.3f}, n={len(d)}",
+                fontsize=11
+            )
+            plt.tight_layout()
+
+            fig_path = os.path.join(args.outdir, f"{tag}fit_master_{m}{method_tag}.png")
+            plt.savefig(fig_path, dpi=300)
+            plt.close()
+
+            summary_rows.append({
+                "model": m,
+                "method": method,
+                "ell_min_power": ell_min,
+                "ell_max_power": ell_max,
+                "beta_power": beta,
+                "beta_r2": beta_r2,
+                "n_points_fit": int(len(d)),
+                "unique_N": int(n_unique),
+                "slope_b": float(b),
+                "intercept_a": float(a),
+                "r2": float(r2),
+                "f_col_used": args.f_col,
+                "N_col_used": args.N_col,
+                "n_seeds": len(seed_dirs),
+            })
+
             if args.verbose:
                 print(
-                    f"[warn] {m}: N_req has only {n_unique} unique values in window (degenerate). Skipping fit."
+                    f"[done] {m} ({method}): slope={b:.3f} R2={r2:.3f} unique_N={n_unique}"
                 )
-            continue
+                print(
+                    f"       wrote {os.path.basename(fig_path)} and {os.path.basename(pts_path)}"
+                )
 
-        d["kappa_alpha"] = d["alpha_hat"] / (d["alpha_hat"] - 1.0)
-        d["x"] = -d["kappa_alpha"] * np.log(d["f_hat"].values)
-        d["y"] = np.log(d["N_req"].values)
-
-        a, b, r2, yhat = linfit(d["x"].values, d["y"].values)
-        d["y_hat"] = yhat
-
-        pts_path = os.path.join(args.outdir, f"fit_master_points_{m}.csv")
-        d.to_csv(pts_path, index=False)
-
-        # Plot
-        plt.figure(figsize=(7, 5))
-
-        # Plot seed-averaged data
-        plt.scatter(d["x"].values, d["y"].values, s=80, alpha=0.7, zorder=3)
-
-        # If multi-seed, also plot individual seed points (lighter)
-        if is_multiseed and seed_dfs:
-            for seed_df in seed_dfs:
-                # Apply same filters as aggregated data
-                seed_df = seed_df.dropna()
-                seed_df = seed_df[
-                    (seed_df["ell"] >= ell_min) & (seed_df["ell"] <= ell_max)
-                ]
-                seed_df = seed_df[
-                    (seed_df["f_hat"] > 0)
-                    & (seed_df["alpha_hat"] > args.alpha_floor)
-                    & (seed_df["N_req"] > 0)
-                ]
-
-                if len(seed_df) > 0:
-                    seed_df["kappa_alpha"] = seed_df["alpha_hat"] / (
-                        seed_df["alpha_hat"] - 1.0
-                    )
-                    seed_df["x"] = -seed_df["kappa_alpha"] * np.log(
-                        seed_df["f_hat"].values
-                    )
-                    seed_df["y"] = np.log(seed_df["N_req"].values)
-                    plt.scatter(
-                        seed_df["x"].values,
-                        seed_df["y"].values,
-                        s=20,
-                        alpha=0.15,
-                        color="C0",
-                        zorder=1
-                    )
-
-        # Fit line
-        xline = np.linspace(d["x"].min(), d["x"].max(), 200)
-        plt.plot(xline, a + b * xline, "r-", linewidth=2, zorder=2)
-
-        plt.xlabel(r"$-\kappa_{\alpha}(\ell)\,\log \hat f(\ell)$", fontsize=11)
-        plt.ylabel(r"$\log \hat N(\ell)$", fontsize=11)
-        plt.title(
-            f"{m}: slope={b:.3f}, intercept={a:.3f}, $R^2$={r2:.3f}, n={len(d)}",
-            fontsize=11
-        )
-        plt.tight_layout()
-
-        fig_path = os.path.join(args.outdir, f"fit_master_{m}.png")
-        plt.savefig(fig_path, dpi=300)
-        plt.close()
-
-        summary_rows.append({
-            "model": m,
-            "ell_min_power": ell_min,
-            "ell_max_power": ell_max,
-            "beta_power": beta,
-            "beta_r2": beta_r2,
-            "n_points_fit": int(len(d)),
-            "unique_N": int(n_unique),
-            "slope_b": float(b),
-            "intercept_a": float(a),
-            "r2": float(r2),
-            "f_col_used": args.f_col,
-            "N_col_used": args.N_col,
-            "n_seeds": len(seed_dirs),
-        })
-
-        if args.verbose:
-            print(
-                f"[done] {m}: slope={b:.3f} R2={r2:.3f} unique_N={n_unique}"
-            )
-            print(
-                f"       wrote {os.path.basename(fig_path)} and {os.path.basename(pts_path)}"
-            )
-
-    if summary_rows:
-        summ = pd.DataFrame(summary_rows)
-        summ_path = os.path.join(args.outdir, "fit_master_summary.csv")
-        summ.to_csv(summ_path, index=False)
-        if args.verbose:
-            print(f"\n[info] wrote summary: {summ_path}")
-    else:
-        if args.verbose:
-            print(
-                "\n[warn] no non-degenerate fits produced. "
-                "(Often means N_required_at_eps saturates or is mostly invalid in that lag window.)"
-            )
+        if summary_rows:
+            summ = pd.DataFrame(summary_rows)
+            summ_path = os.path.join(args.outdir, f"{tag}fit_master_summary{method_tag}.csv")
+            summ.to_csv(summ_path, index=False)
+            if args.verbose:
+                print(f"\n[info] ({method}) wrote summary: {summ_path}")
+        else:
+            if args.verbose:
+                print(
+                    f"\n[warn] ({method}) no non-degenerate fits produced. "
+                    "(Often means N_required_at_eps saturates or is mostly invalid in that lag window.)"
+                )
 
 if __name__ == "__main__":
     main()

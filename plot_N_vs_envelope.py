@@ -25,11 +25,25 @@ import seed_utils
 CANDIDATE_MODELS = ["const", "shared", "diag", "gru", "lstm"]
 
 
+# ── Helper functions for dual-alpha format ──
+def _alpha_col(method):
+    """Return column name for alpha given method."""
+    return f"alpha_{method}"
+
+def _nreq_col(method):
+    """Return column name for N_required given method."""
+    return f"N_required_{method}"
+
+
+SEED_MARKERS = ["o", "s", "^", "D", "v"]  # distinct markers per seed
+
+
 def parse_args():
     p = argparse.ArgumentParser()
 
     # Multi-seed arguments
     seed_utils.add_multiseed_args(p)
+    seed_utils.add_view_arg(p)
     p.add_argument(
         "--outdir",
         type=str,
@@ -69,19 +83,22 @@ def aggregate_summaries(dfs):
     )
 
 
-def plot_model_with_individual_seeds(model, dfs, agg_df, outfile):
+def plot_model_with_individual_seeds(model, dfs, agg_df, outfile, method: str = "ecf"):
     """
     Plot N vs mu for a model, showing:
       - Individual seed points in light gray
       - Averaged points with linear fit in bold
     """
+    nreq_col = _nreq_col(method)
     fig, ax = plt.subplots(figsize=(6, 4))
 
     # Plot individual seed data points (light gray)
     if len(dfs) > 1:
         for df in dfs:
             mu_vals = df["mu_l1_mean"].to_numpy(dtype=float)
-            Nreq_vals = df["N_required_at_eps"].to_numpy(dtype=float)
+            # Try method-specific column first, fall back to old format
+            col_to_use = nreq_col if nreq_col in df.columns else "N_required_at_eps"
+            Nreq_vals = df[col_to_use].to_numpy(dtype=float)
 
             mask = (
                 np.isfinite(mu_vals) & (mu_vals > 0) &
@@ -97,7 +114,10 @@ def plot_model_with_individual_seeds(model, dfs, agg_df, outfile):
 
     # Plot aggregated (mean) data points
     mu_vals = agg_df["mu_l1_mean_mean"].to_numpy(dtype=float)
-    Nreq_vals = agg_df["N_required_at_eps_mean"].to_numpy(dtype=float)
+    nreq_col_mean = f"{nreq_col}_mean" if f"{nreq_col}_mean" in agg_df.columns else "N_required_at_eps_mean"
+    if nreq_col_mean not in agg_df.columns:
+        nreq_col_mean = "N_required_at_eps"
+    Nreq_vals = agg_df[nreq_col_mean].to_numpy(dtype=float)
 
     mask = (
         np.isfinite(mu_vals) & (mu_vals > 0) &
@@ -135,7 +155,7 @@ def plot_model_with_individual_seeds(model, dfs, agg_df, outfile):
 
     ax.set_xlabel(r"$-\log \hat{f}(\ell)$")
     ax.set_ylabel(r"$\log \widehat{N}(\ell)$")
-    ax.set_title(rf"Scaling of $\log \widehat{{N}}(\ell)$ vs $-\log \hat{{f}}(\ell)$ ({model})")
+    ax.set_title(rf"Scaling of $\log \widehat{{N}}(\ell)$ vs $-\log \hat{{f}}(\ell)$ ({model}, {method})")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -145,18 +165,48 @@ def plot_model_with_individual_seeds(model, dfs, agg_df, outfile):
 
     if coeff is not None:
         print(
-            f"[ok] {model}: saved {outfile} | "
+            f"[ok] {model} ({method}): saved {outfile} | "
             f"fit: log N ≈ {coeff[0]:.3f} + {coeff[1]:.3f} * (-log f) | "
             f"R² = {r2:.6f}"
         )
     else:
-        print(f"[ok] {model}: saved {outfile} | fit skipped (need >=2 points)")
+        print(f"[ok] {model} ({method}): saved {outfile} | fit skipped (need >=2 points)")
+
+
+def plot_model_per_seed(model, seed_traces, outfile):
+    """Plot per-seed scatter with color-coded seeds and per-seed fits."""
+    fig, ax = plt.subplots(figsize=(6, 4))
+    color = seed_utils.get_model_color(model)
+
+    for i, (seed_label, df) in enumerate(seed_traces):
+        mu_vals = df["mu_l1_mean"].to_numpy(dtype=float)
+        Nreq_vals = df["N_required_at_eps"].to_numpy(dtype=float)
+        mask = np.isfinite(mu_vals) & (mu_vals > 0) & np.isfinite(Nreq_vals) & (Nreq_vals > 0)
+        if not np.any(mask):
+            continue
+
+        x = -np.log(mu_vals[mask] + 1e-20)
+        y = np.log(Nreq_vals[mask])
+        alpha = seed_utils.SEED_ALPHAS[i] if i < len(seed_utils.SEED_ALPHAS) else 0.3
+        marker = SEED_MARKERS[i] if i < len(SEED_MARKERS) else "o"
+        ax.scatter(x, y, alpha=alpha, s=20, color=color, marker=marker,
+                   label=seed_label, zorder=2)
+
+    ax.set_xlabel(r"$-\log \hat{f}(\ell)$")
+    ax.set_ylabel(r"$\log \widehat{N}(\ell)$")
+    ax.set_title(rf"$\log \widehat{{N}}(\ell)$ vs $-\log \hat{{f}}(\ell)$ ({model}) [per seed]")
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(outfile, dpi=300)
+    plt.close(fig)
+    print(f"[ok] saved: {outfile}")
 
 
 def main():
     args = parse_args()
+    view = args.view
 
-    # Resolve input directories and discover seed directories
     inputdirs = seed_utils.resolve_inputdirs(args)
     seed_dirs = seed_utils.discover_from_multiple_inputdirs(inputdirs)
 
@@ -166,46 +216,71 @@ def main():
     outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
 
-    print(f"[info] loading CSVs from: {[os.path.abspath(d) for d in seed_dirs]}")
     print(f"[info] saving figures to: {os.path.abspath(outdir)}")
+    print(f"[info] view mode: {view}")
 
-    # Print seed information
     seed_utils.print_seed_info(seed_dirs, inputdirs)
 
-    # Detect which models are present across all seed dirs
     models = seed_utils.detect_models_in_dirs(seed_dirs)
-
     if not models:
-        raise FileNotFoundError(
-            "No model '*_summary.csv' files found in:\n"
-            f"  {[os.path.abspath(d) for d in seed_dirs]}\n"
-            f"Expected one or more of: const, shared, diag, gru, lstm"
-        )
+        raise FileNotFoundError("No model '*_summary.csv' files found")
 
     print(f"[info] found {len(models)} model(s): {', '.join(models)}")
 
+    # Detect which alpha methods are available
+    alpha_methods = ["ecf", "mcc"]  # Try both; fall back to old format if needed
+    sample_df = None
     for mname in models:
-        print(f"\n[processing] {mname}")
-
-        # Load summaries from each seed
         dfs = load_summaries_across_seeds(seed_dirs, mname)
+        if dfs:
+            sample_df = dfs[0]
+            break
 
-        if not dfs:
-            print(f"[warn] {mname}: no summary files found across seeds.")
-            continue
+    if sample_df is not None:
+        if "alpha_ecf" in sample_df.columns:
+            alpha_methods = ["ecf", "mcc"]
+        elif "alpha_mcc" in sample_df.columns:
+            alpha_methods = ["mcc"]
+        elif "alpha_hat" in sample_df.columns:
+            alpha_methods = ["hat"]
+        else:
+            alpha_methods = ["hat"]
+    else:
+        alpha_methods = ["hat"]
 
-        print(f"  [info] {len(dfs)} seed(s) with {mname}_summary.csv")
+    print(f"[info] detected alpha methods: {alpha_methods}")
 
-        # Aggregate across seeds
-        agg_df = aggregate_summaries(dfs)
+    tag = "agg_" if view == "both" else ""
+    ps_tag = "ps_" if view == "both" else ""
 
-        if agg_df.empty:
-            print(f"[warn] {mname}: aggregation produced empty DataFrame.")
-            continue
+    for method in alpha_methods:
+        print(f"\n[processing] alpha method: {method}")
+        method_tag = f"_{method}" if len(alpha_methods) > 1 else ""
 
-        # Plot
-        outpath = os.path.join(outdir, f"N_vs_mu_{mname}.png")
-        plot_model_with_individual_seeds(mname, dfs, agg_df, outpath)
+        for mname in models:
+            print(f"  [model] {mname}")
+
+            dfs = load_summaries_across_seeds(seed_dirs, mname)
+            if not dfs:
+                print(f"[warn] {mname}: no summary files found.")
+                continue
+
+            print(f"    [info] {len(dfs)} seed(s)")
+
+            # ── AGGREGATED VIEW ──
+            if view in ("aggregated", "both"):
+                agg_df = aggregate_summaries(dfs)
+                if not agg_df.empty:
+                    outpath = os.path.join(outdir, f"{tag}N_vs_mu_{mname}{method_tag}.png")
+                    plot_model_with_individual_seeds(mname, dfs, agg_df, outpath, method=method)
+
+            # ── PER-SEED VIEW ──
+            if view in ("per_seed", "both"):
+                required = {"ell", "mu_l1_mean", _nreq_col(method) if method != "hat" else "N_required_at_eps"}
+                seed_traces = seed_utils.load_model_data_per_seed(seed_dirs, mname, required)
+                if seed_traces:
+                    outpath = os.path.join(outdir, f"{ps_tag}N_vs_mu_{mname}{method_tag}.png")
+                    plot_model_per_seed(mname, seed_traces, outpath)
 
     print("\n[done] scaling plot complete")
 

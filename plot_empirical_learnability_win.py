@@ -29,6 +29,7 @@ import seed_utils
 def parse_args():
     p = argparse.ArgumentParser()
     seed_utils.add_multiseed_args(p)
+    seed_utils.add_view_arg(p)
     p.add_argument(
         "--outdir",
         type=str,
@@ -191,8 +192,33 @@ def plot_boxplot(ax, seed_dirs, present):
     ax.set_xticklabels([f"{int(n)}" for n in N_sorted], rotation=45, fontsize=7)
 
 
+def plot_per_seed(ax, seed_dirs, present):
+    """Plot individual seed traces overlaid with consistent model colors."""
+    per_seed = seed_utils.collect_H_N_per_seed(seed_dirs)
+    legend_handles = {}
+
+    for label, (col, _) in present.items():
+        color = seed_utils.get_model_color(label)
+        for i, (seed_label, df) in enumerate(sorted(per_seed.items())):
+            if col not in df.columns:
+                continue
+            N = df["N"].to_numpy(dtype=float)
+            H = df[col].to_numpy(dtype=float)
+            mask = np.isfinite(N) & np.isfinite(H) & (N > 0)
+            if mask.sum() == 0:
+                continue
+            alpha = seed_utils.SEED_ALPHAS[i] if i < len(seed_utils.SEED_ALPHAS) else 0.3
+            line, = ax.plot(N[mask], H[mask], "o-", color=color, alpha=alpha,
+                            markersize=3, linewidth=0.8)
+            if label not in legend_handles:
+                legend_handles[label] = line
+
+    return legend_handles
+
+
 def main():
     args = parse_args()
+    view = args.view
 
     # Resolve input directories
     inputdirs = seed_utils.resolve_inputdirs(args)
@@ -209,7 +235,7 @@ def main():
 
     seed_utils.print_seed_info(seed_dirs, inputdirs)
     print(f"[info] saving figure to: {os.path.abspath(outdir)}")
-    print(f"[info] H_N view: {args.hn_view}")
+    print(f"[info] H_N view: {args.hn_view}, view mode: {view}")
 
     # Load H_N_summary.csv from each seed
     print("[info] loading H_N_summary.csv from each seed...")
@@ -231,7 +257,22 @@ def main():
 
     print("[info] columns in aggregated data:", list(agg.columns))
 
-    # Extract model columns
+    # Detect which alpha methods are available
+    alpha_methods = []
+    if any("_ecf_mean" in col for col in agg.columns):
+        alpha_methods.append("ecf")
+    if any("_mcc_mean" in col for col in agg.columns):
+        alpha_methods.append("mcc")
+    if not alpha_methods and any("H_N_const_mean" in agg.columns for _ in [1]):
+        # Old format without method suffix
+        alpha_methods.append("base")
+
+    if not alpha_methods:
+        alpha_methods = ["base"]  # Default to old format
+
+    print(f"[info] detected H_N methods: {alpha_methods}")
+
+    # Extract model columns and loop over methods
     MODEL_COLS = {
         "const": "H_N_const",
         "shared": "H_N_shared",
@@ -240,64 +281,89 @@ def main():
         "lstm": "H_N_lstm",
     }
 
-    # Find which models are present and have mean data
-    present = {}
-    for label, col in MODEL_COLS.items():
-        mean_col = f"{col}_mean"
-        if mean_col in agg.columns:
-            present[label] = (col, mean_col)
+    # Loop over methods and generate separate plots
+    for method in alpha_methods:
+        method_tag = f"_{method}" if len(alpha_methods) > 1 else ""
 
-    if not present:
-        raise ValueError(
-            "Aggregated data does not contain any recognized H_N_*_mean columns.\n"
-            "Expected at least one of:\n  "
-            + "\n  ".join([f"{col}_mean" for col in MODEL_COLS.values()])
-        )
+        # Find which models are present and have mean data for this method
+        present = {}
+        for label, col in MODEL_COLS.items():
+            if method == "base":
+                mean_col = f"{col}_mean"
+            else:
+                mean_col = f"{col}_{method}_mean"
+            if mean_col in agg.columns:
+                present[label] = (col if method == "base" else f"{col}_{method}", mean_col)
 
-    print(f"[info] plotting {len(present)} model curve(s): {', '.join(present.keys())}")
+        if not present:
+            print(f"[warn] Method {method}: no recognized H_N_*_mean columns found. Skipping.")
+            continue
 
-    # Print seed counts for each model
-    for label, (col, mean_col) in present.items():
-        count_col = f"{col}_count"
-        if count_col in agg.columns:
-            n_seeds = int(agg[count_col].max())
-            print(f"  - {label}: {n_seeds} seed(s)")
+        print(f"[info] Method {method}: plotting {len(present)} model curve(s): {', '.join(present.keys())}")
 
-    N_grid = agg["N"].to_numpy(dtype=float)
+        for label, (col, mean_col) in present.items():
+            if method == "base":
+                count_col = f"{col}_count"
+            else:
+                count_col = f"{col}_{method}_count"
+            if count_col in agg.columns:
+                n_seeds = int(agg[count_col].max())
+                print(f"  - {label}: {n_seeds} seed(s)")
 
-    # ── Plot ──
-    fig, ax = plt.subplots(figsize=(6, 4))
+        N_grid = agg["N"].to_numpy(dtype=float)
 
-    if args.hn_view == "mean_std":
-        plot_mean_std(ax, agg, present, N_grid)
-        ax.set_xscale("log")
+        # ── AGGREGATED VIEW ──
+        if view in ("aggregated", "both"):
+            tag = "agg_" if view == "both" else ""
+            fig, ax = plt.subplots(figsize=(6, 4))
 
-    elif args.hn_view == "percentile":
-        plot_percentile(ax, seed_dirs, present, args.pct_lo, args.pct_hi)
-        ax.set_xscale("log")
-        pct_label = f"{int(args.pct_lo)}th–{int(args.pct_hi)}th pctl"
-        ax.set_title(
-            r"Empirical learnability window $\widehat{\mathcal{H}}_N$"
-            f" (median + {pct_label})"
-        )
+            if args.hn_view == "mean_std":
+                plot_mean_std(ax, agg, present, N_grid)
+                ax.set_xscale("log")
+            elif args.hn_view == "percentile":
+                plot_percentile(ax, seed_dirs, present, args.pct_lo, args.pct_hi)
+                ax.set_xscale("log")
+                pct_label = f"{int(args.pct_lo)}th–{int(args.pct_hi)}th pctl"
+                ax.set_title(
+                    r"Empirical learnability window $\widehat{\mathcal{H}}_N$"
+                    f" (median + {pct_label}) [aggregated, {method}]"
+                )
+            elif args.hn_view == "boxplot":
+                plot_boxplot(ax, seed_dirs, present)
 
-    elif args.hn_view == "boxplot":
-        plot_boxplot(ax, seed_dirs, present)
-        # x-axis is categorical for boxplot; don't use log scale
+            ax.set_xlabel(r"Training budget $N$")
+            ax.set_ylabel(r"$\widehat{\mathcal{H}}_N$")
+            if args.hn_view not in ("percentile",):
+                ax.set_title(rf"Empirical learnability window $\widehat{{\mathcal{{H}}}}_N$ [aggregated, {method}]")
+            ax.legend()
+            fig.tight_layout()
 
-    ax.set_xlabel(r"Training budget $N$")
-    ax.set_ylabel(r"$\widehat{\mathcal{H}}_N$")
-    if args.hn_view != "percentile":
-        ax.set_title(r"Empirical learnability window $\widehat{\mathcal{H}}_N$")
-    ax.legend()
-    fig.tight_layout()
+            suffix = {"mean_std": "", "percentile": "_percentile", "boxplot": "_boxplot"}
+            outpath = os.path.join(outdir, f"{tag}H_N_curves{suffix[args.hn_view]}{method_tag}.png")
+            fig.savefig(outpath, dpi=300)
+            plt.close(fig)
+            print(f"[ok] saved: {outpath}")
 
-    suffix = {"mean_std": "", "percentile": "_percentile", "boxplot": "_boxplot"}
-    outpath = os.path.join(outdir, f"H_N_curves{suffix[args.hn_view]}.png")
-    fig.savefig(outpath, dpi=300)
-    plt.close(fig)
+        # ── PER-SEED VIEW ──
+        if view in ("per_seed", "both"):
+            tag = "ps_" if view == "both" else ""
+            fig, ax = plt.subplots(figsize=(6, 4))
 
-    print(f"[ok] saved: {outpath}")
+            legend_handles = plot_per_seed(ax, seed_dirs, present)
+
+            ax.set_xscale("log")
+            ax.set_xlabel(r"Training budget $N$")
+            ax.set_ylabel(r"$\widehat{\mathcal{H}}_N$")
+            ax.set_title(rf"Empirical learnability window $\widehat{{\mathcal{{H}}}}_N$ [per seed, {method}]")
+            if legend_handles:
+                ax.legend(legend_handles.values(), legend_handles.keys())
+            fig.tight_layout()
+
+            suffix = {"mean_std": "", "percentile": "_percentile", "boxplot": "_boxplot"}
+            outpath = os.path.join(outdir, f"{tag}H_N_curves{suffix[args.hn_view]}{method_tag}.png")
+            fig.savefig(outpath, dpi=300)
+            plt.close(fig)
+            print(f"[ok] saved: {outpath}")
 
 
 if __name__ == "__main__":

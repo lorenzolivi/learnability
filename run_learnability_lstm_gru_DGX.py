@@ -118,6 +118,237 @@ def log(msg: str) -> None:
 
 
 # ============================================================
+# Adaptive base rates (generalized effective learning rates)
+# ============================================================
+
+def compute_adaptive_base_rates(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    lr: float,
+    eps: float = 1e-8,
+    beta2: float = 0.999,
+) -> np.ndarray:
+    """
+    Compute per-neuron adaptive base rates Λ^(q)_r via the row-mean projection.
+
+    Under layer normalization, the Rayleigh-quotient projection
+    (Eq. layernorm_simplification in the paper) simplifies to:
+
+        Λ^(q)_r ≈ (1/H) Σ_j [Λ_r^(U•)]_{qj}
+
+    where [Λ_r^(U•)]_{qj} = lr / (sqrt(v̂_{qj}) + ε).
+
+    We average across all recurrent weight matrices (H×H).
+    For SGD-like optimizers without second-moment state, returns
+    uniform lr (i.e., Λ^(q)_r = μ for all q).
+
+    Returns:
+        Lambda_q: (H,) array of per-neuron adaptive base rates Λ^(q)_r.
+    """
+    H = model.H
+
+    # Collect all recurrent weight matrices (H×H)
+    recurrent_params = []
+    for name, param in model.named_parameters():
+        # Match recurrent weight matrices: U*.weight with shape (H, H)
+        if param.shape == (H, H) and "weight" in name and "out" not in name:
+            recurrent_params.append((name, param))
+
+    if not recurrent_params:
+        return np.full(H, lr, dtype=np.float64)
+
+    # Check if optimizer has second-moment state (Adam/AdamW/RMSprop)
+    state = optimizer.state
+    has_v = False
+    for _, p in recurrent_params:
+        if p in state:
+            if "exp_avg_sq" in state[p]:       # Adam/AdamW
+                has_v = True
+                break
+            elif "square_avg" in state[p]:      # RMSprop
+                has_v = True
+                break
+
+    if not has_v:
+        log(f"[adaptive_base_rates] No second-moment state found; returning uniform lr={lr:.2e}")
+        return np.full(H, lr, dtype=np.float64)
+
+    # Compute row-mean projection for each recurrent weight matrix
+    Lambda_per_matrix = []
+    for name, param in recurrent_params:
+        pstate = state.get(param, {})
+
+        # Get second-moment estimate v
+        if "exp_avg_sq" in pstate:         # Adam/AdamW
+            v = pstate["exp_avg_sq"]       # (H, H)
+            step = pstate.get("step", 1)
+            if isinstance(step, torch.Tensor):
+                step = step.item()
+            step = max(int(step), 1)
+            v_hat = v / (1.0 - beta2 ** step)
+        elif "square_avg" in pstate:        # RMSprop
+            v_hat = pstate["square_avg"]    # already the EMA, no bias correction
+        else:
+            continue
+
+        # Guard: skip matrices with corrupted optimizer state (e.g. after NaN halt)
+        if not torch.isfinite(v_hat).all():
+            log(f"[adaptive_base_rates] {name}: non-finite v_hat entries "
+                f"({(~torch.isfinite(v_hat)).sum().item()} / {v_hat.numel()}), skipping")
+            continue
+
+        # Per-parameter adaptive rates: λ_{qj} = lr / (sqrt(v̂_{qj}) + ε)
+        lam = lr / (torch.sqrt(v_hat.float()) + eps)  # (H, H)
+
+        # Row mean: Λ^(q, U•)_r = (1/H) Σ_j λ_{qj}
+        row_mean = lam.mean(dim=1)  # (H,)
+        Lambda_per_matrix.append(row_mean.detach().cpu().numpy())
+        log(f"[adaptive_base_rates] {name}: row-mean range "
+            f"[{row_mean.min().item():.4e}, {row_mean.max().item():.4e}], "
+            f"mean={row_mean.mean().item():.4e}")
+
+    if not Lambda_per_matrix:
+        return np.full(H, lr, dtype=np.float64)
+
+    # Average across all recurrent weight matrices (equal weight under layer norm)
+    Lambda_q = np.mean(Lambda_per_matrix, axis=0).astype(np.float64)  # (H,)
+    log(f"[adaptive_base_rates] final Λ^(q) range [{Lambda_q.min():.4e}, {Lambda_q.max():.4e}], "
+        f"mean={Lambda_q.mean():.4e}, ratio max/min={Lambda_q.max()/max(Lambda_q.min(),1e-30):.2f}")
+    return Lambda_q
+
+
+def extract_adaptive_rate_matrix(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    lr: float,
+    eps: float = 1e-8,
+    beta2: float = 0.999,
+) -> Tuple[Optional[torch.Tensor], np.ndarray]:
+    """
+    Extract the per-parameter adaptive rate matrix λ_{qj} from the optimizer.
+
+    Returns:
+        lambda_matrix: (H, H) tensor of per-parameter rates, averaged across
+                       all recurrent weight matrices.  None if no second-moment
+                       state (SGD).
+        lambda_rowmean: (H,) numpy array — the LN-approximated row mean
+                        (same as compute_adaptive_base_rates output).
+    """
+    H = model.H
+
+    # Collect recurrent weight matrices (H×H)
+    recurrent_params = []
+    for name, param in model.named_parameters():
+        if param.shape == (H, H) and "weight" in name and "out" not in name:
+            recurrent_params.append((name, param))
+
+    if not recurrent_params:
+        return None, np.full(H, lr, dtype=np.float64)
+
+    # Check for second-moment state
+    state = optimizer.state
+    has_v = False
+    for _, p in recurrent_params:
+        if p in state:
+            if "exp_avg_sq" in state[p] or "square_avg" in state[p]:
+                has_v = True
+                break
+
+    if not has_v:
+        return None, np.full(H, lr, dtype=np.float64)
+
+    # Collect per-parameter rate matrices
+    lam_matrices = []
+    for name, param in recurrent_params:
+        pstate = state.get(param, {})
+        if "exp_avg_sq" in pstate:
+            v = pstate["exp_avg_sq"]
+            step = pstate.get("step", 1)
+            if isinstance(step, torch.Tensor):
+                step = step.item()
+            step = max(int(step), 1)
+            v_hat = v / (1.0 - beta2 ** step)
+        elif "square_avg" in pstate:
+            v_hat = pstate["square_avg"]
+        else:
+            continue
+
+        if not torch.isfinite(v_hat).all():
+            log(f"[adaptive_rate_matrix] {name}: non-finite v_hat, skipping")
+            continue
+
+        lam = lr / (torch.sqrt(v_hat.float()) + eps)  # (H, H)
+        lam_matrices.append(lam)
+
+    if not lam_matrices:
+        return None, np.full(H, lr, dtype=np.float64)
+
+    # Average across recurrent weight matrices
+    lambda_matrix = torch.stack(lam_matrices, dim=0).mean(dim=0)  # (H, H)
+    lambda_rowmean = lambda_matrix.mean(dim=1).detach().cpu().numpy().astype(np.float64)
+
+    log(f"[adaptive_rate_matrix] λ_{{qj}} matrix: "
+        f"mean={lambda_matrix.mean().item():.4e}, "
+        f"row-mean range [{lambda_rowmean.min():.4e}, {lambda_rowmean.max():.4e}]")
+
+    return lambda_matrix.detach(), lambda_rowmean
+
+
+def compute_lag_dependent_rates(
+    lambda_matrix: torch.Tensor,
+    hseq: torch.Tensor,
+    T_valid: int,
+    fallback_rate: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute the lag-dependent Rayleigh-quotient base rates Λ^(q)_{r,ℓ}(b,t).
+
+    For a perturbation at time step k, the pre-synaptic state is h_{k-1}.
+    The Rayleigh quotient restricted to the recurrent block is:
+
+        Λ^(q)(b,k) = Σ_j λ_{qj} h²_{k-1,j}(b) / Σ_j h²_{k-1,j}(b)
+
+    When h_{k-1} = 0 (initial state), falls back to the row-mean rate.
+
+    Args:
+        lambda_matrix: (H, H) per-parameter adaptive rate matrix λ_{qj}.
+        hseq:          (B, T, H) hidden state sequence from forward pass.
+        T_valid:       number of valid time positions.
+        fallback_rate: (H,) rate to use when h=0 (typically the row mean).
+
+    Returns:
+        Lambda_ell: (B, T_valid, H) per-neuron adaptive base rates.
+    """
+    B, T_full, H = hseq.shape
+    device = hseq.device
+    dtype = hseq.dtype
+
+    # Pre-synaptic hidden states at perturbation times:
+    #   position k=0 → h_{-1} = 0 (initial state)
+    #   position k≥1 → h_{k-1} = hseq[:, k-1, :]
+    h_pre = torch.zeros(B, T_valid, H, device=device, dtype=dtype)
+    n_copy = min(T_valid - 1, T_full)
+    if n_copy > 0:
+        h_pre[:, 1:1+n_copy, :] = hseq[:, :n_copy, :]
+
+    h_sq = h_pre ** 2  # (B, T_valid, H)
+    h_sq_sum = h_sq.sum(dim=2, keepdim=True)  # (B, T_valid, 1)
+
+    # Rayleigh quotient: Λ[b,t,q] = Σ_j λ[q,j] h²[b,t,j] / Σ_j h²[b,t,j]
+    numer = torch.matmul(h_sq.float(), lambda_matrix.T.float())  # (B, T_valid, H)
+
+    # Avoid division by zero: mask positions with h=0
+    zero_mask = (h_sq_sum.squeeze(-1) < 1e-30)  # (B, T_valid)
+    Lambda_ell = numer / (h_sq_sum.float() + 1e-30)  # (B, T_valid, H)
+
+    # Replace h=0 positions with fallback (row-mean) rate
+    if zero_mask.any():
+        Lambda_ell[zero_mask] = fallback_rate.float().unsqueeze(0)
+
+    return Lambda_ell
+
+
+# ============================================================
 # Evaluation helper: streaming MSE and R² computation
 # ============================================================
 
@@ -303,7 +534,7 @@ class _StableQuantileCache:
         self.cache_q[key] = out
         return out
 
-    def ensure_grid(self, n_grid: int = 201):
+    def ensure_grid(self, n_grid: int = 201):  # 201 points → Δα ≈ 0.005 resolution
         if self._grid_ready:
             return
         alpha_grid = np.linspace(1.0, 2.0, int(n_grid))
@@ -425,17 +656,14 @@ def estimate_alpha_sigma_ecf_symmetric(samples: np.ndarray) -> Tuple[float, floa
     intercept = Ybar - alpha_hat * Xbar
 
     alpha_hat = float(np.clip(alpha_hat, 1.0, 2.0))
-    if alpha_hat > 0:
-        sigma_hat = float((np.exp(intercept) / 2.0) ** (1.0 / alpha_hat))
-    else:
-        sigma_hat = 0.0
+    sigma_hat = float((np.exp(intercept) / 2.0) ** (1.0 / alpha_hat))
 
     return alpha_hat, float(max(0.0, sigma_hat))
 
 
 def estimate_alpha_sigma(
     samples: np.ndarray,
-    method: str = "mcculloch",
+    method: str = "ecf",
     n_samples_for_ecf: int = 100000,
 ) -> Tuple[float, float, bool]:
     """Unified α̂ estimation with reliability checking."""
@@ -810,6 +1038,8 @@ def train_model(args, model: nn.Module,
         epoch, train_loss, train_acc (R²), val_loss, val_acc (R²).
     Optionally logs periodic gate statistics to gate_stats_<model>.csv.
     Halts early if NaN/Inf loss is detected.
+
+    Returns the optimizer (needed for extracting adaptive base rates).
     """
     if args.optimizer == "adamw":
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -817,8 +1047,15 @@ def train_model(args, model: nn.Module,
         opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.0, weight_decay=args.weight_decay)
     elif args.optimizer == "sgd_momentum":
         opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    elif args.optimizer == "rmsprop":
+        opt = torch.optim.RMSprop(
+            model.parameters(), lr=args.lr,
+            alpha=args.rmsprop_alpha,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
     else:
-        raise ValueError("Unknown optimizer")
+        raise ValueError(f"Unknown optimizer {args.optimizer}")
 
     Btot = int(Xtr_cpu.shape[0])
     bs = int(args.batch_size)
@@ -941,7 +1178,10 @@ def train_model(args, model: nn.Module,
 
                 del xb0, gdbg
 
-    log(f"[train:{model_name}] done")
+    if nan_halt:
+        log(f"[train:{model_name}] WARNING: training halted due to NaN/Inf loss")
+    log(f"[train:{model_name}] done (nan_halt={nan_halt})")
+    return opt, nan_halt
 
 
 # ============================================================
@@ -1147,8 +1387,45 @@ def run_for_model(args, model_name: str, mdir: str,
 
     log(f"[run:{model_name}] train start")
     t_train0 = now_s()
-    train_model(args, model, Xtr_cpu, Ytr_cpu, mdir, model_name, device=device, u_vec=u_vec)
+    opt, nan_halt = train_model(args, model, Xtr_cpu, Ytr_cpu, mdir, model_name, device=device, u_vec=u_vec)
     log(f"[run:{model_name}] train done  dt={now_s()-t_train0:.1f}s")
+
+    if nan_halt:
+        log(f"[diag:{model_name}] WARNING: training diverged (NaN halt). "
+            f"Adaptive base rates will fall back to uniform lr={args.lr:.2e}. "
+            f"Diagnostic metrics may be unreliable.")
+
+    # ------------------------------------------------------------------
+    # Generalized effective learning rates: compute per-neuron adaptive
+    # base rates from optimizer second-moment state.
+    #
+    # Two versions:
+    #   lambda_matrix (H,H): full per-parameter rate matrix λ_{qj} for
+    #       lag-dependent Rayleigh-quotient projection (exact).
+    #   Lambda_q_rowmean (H,): row mean of lambda_matrix — the
+    #       LN-approximated, lag-independent base rate (for comparison).
+    # ------------------------------------------------------------------
+    lambda_matrix, Lambda_q_rowmean = extract_adaptive_rate_matrix(model, opt, lr=args.lr)
+    use_lag_dependent = (lambda_matrix is not None)
+
+    # Fallback for SGD or corrupted state: uniform lr
+    Lambda_q_fallback = torch.tensor(Lambda_q_rowmean, dtype=torch.float32, device=device)  # (H,)
+    if use_lag_dependent:
+        lambda_matrix = lambda_matrix.to(device)
+        log(f"[diag:{model_name}] using LAG-DEPENDENT Rayleigh-quotient base rates "
+            f"(row-mean range [{Lambda_q_rowmean.min():.4e}, {Lambda_q_rowmean.max():.4e}])")
+    else:
+        log(f"[diag:{model_name}] using UNIFORM base rate lr={args.lr:.4e} (SGD or no second-moment state)")
+
+    # Save LN-approximated (row-mean) base rates to CSV for comparison
+    Lambda_q_path = os.path.join(mdir, f"{model_name}_adaptive_base_rates.csv")
+    with open(Lambda_q_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["neuron_q", "Lambda_q"])
+        for q_idx in range(len(Lambda_q_rowmean)):
+            w.writerow([q_idx, float(Lambda_q_rowmean[q_idx])])
+
+    del opt  # free optimizer memory
 
     model.eval()
 
@@ -1167,6 +1444,15 @@ def run_for_model(args, model_name: str, mdir: str,
     sum_log_mass: Dict[int, float] = {ell: 0.0 for ell in ells_list}
     count_seq: Dict[int, int] = {ell: 0 for ell in ells_list}
     sum_unit: Dict[int, np.ndarray] = {ell: np.zeros(Hdim, dtype=np.float64) for ell in ells_list}
+
+    # Envelope decomposition: f_gates(ell) = mu * sum_q |Gamma^(q)_{t,ell}|
+    sum_mass_gates: Dict[int, float] = {ell: 0.0 for ell in ells_list}
+    sum_unit_gates: Dict[int, np.ndarray] = {ell: np.zeros(Hdim, dtype=np.float64) for ell in ells_list}
+
+    # Lag-dependent base rate statistics: track per-lag Λ^(q)_{r,ℓ} distribution
+    sum_lambda_mean: Dict[int, float] = {ell: 0.0 for ell in ells_list}
+    sum_lambda_sq: Dict[int, float] = {ell: 0.0 for ell in ells_list}
+    count_lambda: Dict[int, int] = {ell: 0 for ell in ells_list}
 
     sum_psi: Dict[int, float] = {ell: 0.0 for ell in ells_list}
     count_psi: Dict[int, int] = {ell: 0 for ell in ells_list}
@@ -1213,7 +1499,7 @@ def run_for_model(args, model_name: str, mdir: str,
             yb = Ydg_cpu[lo:hi].to(device, non_blocking=True)
 
             with torch.no_grad():
-                yhat, _, g = model.forward_with_intermediates(xb)
+                yhat, hseq, g = model.forward_with_intermediates(xb)
 
             vseq = compute_vseq_jvp(model, xb, w_seed=args.w_seed).detach()
 
@@ -1261,6 +1547,37 @@ def run_for_model(args, model_name: str, mdir: str,
                         else:
                             mu = mu0
 
+                    # ---------------------------------------------------------
+                    # Envelope decomposition: accumulate f_gates(ell) = mu * |Gamma|
+                    # BEFORE applying the adaptive base rate Lambda^(q)_r.
+                    # mu here is the transport factor Gamma^(q)_{t,ell}.
+                    # ---------------------------------------------------------
+                    if mu.numel() > 0:
+                        abs_gamma = torch.abs(mu).double()
+                        gates_mass = (args.lr * abs_gamma.mean(dim=2).mean(dim=1)).sum().item()
+                        sum_mass_gates[ell] += float(gates_mass)
+                        sum_unit_gates[ell] += (args.lr * abs_gamma.mean(dim=1).sum(dim=0)).detach().cpu().numpy()
+
+                    # ---------------------------------------------------------
+                    # Effective learning rate: mu^(q)_{t,ell} = Lambda^(q)_{r,ell} * Gamma^(q)_{t,ell}
+                    # Lag-dependent Rayleigh quotient (exact) or uniform fallback (SGD)
+                    # ---------------------------------------------------------
+                    if use_lag_dependent and mu.numel() > 0:
+                        Lambda_ell = compute_lag_dependent_rates(
+                            lambda_matrix, hseq, mu.shape[1], Lambda_q_fallback)
+                        mu = mu * Lambda_ell.to(mu.dtype)
+                        # Track per-lag Lambda statistics
+                        lam_flat = Lambda_ell.detach().float()
+                        lam_mean_val = lam_flat.mean().item()
+                        lam_sq_val = (lam_flat ** 2).mean().item()
+                        n_lam = int(lam_flat.numel())
+                        sum_lambda_mean[ell] += lam_mean_val * n_lam
+                        sum_lambda_sq[ell] += lam_sq_val * n_lam
+                        count_lambda[ell] += n_lam
+                        del Lambda_ell
+                    else:
+                        mu = mu * Lambda_q_fallback.unsqueeze(0).unsqueeze(0)
+
                 with torch.no_grad():
                     if mu.numel() > 0:
                         abs_mu = torch.abs(mu).double()
@@ -1302,7 +1619,7 @@ def run_for_model(args, model_name: str, mdir: str,
                     sum_psi[ell] += float(arr.sum())
                     count_psi[ell] += int(arr.size)
 
-            del xb, yb, yhat, g, vseq, err, delta
+            del xb, yb, yhat, hseq, g, vseq, err, delta
             if device.type == "cuda" and args.cuda_sync:
                 torch.cuda.synchronize()
 
@@ -1319,25 +1636,28 @@ def run_for_model(args, model_name: str, mdir: str,
 
         mu_by_ell: Dict[int, float] = {}
         log_mu_by_ell: Dict[int, float] = {}
-        Nreq_by_ell: Dict[int, int] = {}
-        alpha_by_ell: Dict[int, float] = {}
-        sigma_by_ell: Dict[int, float] = {}
+        Nreq_by_ell_ecf: Dict[int, int] = {}
+        Nreq_by_ell_mcc: Dict[int, int] = {}
+        alpha_by_ell_ecf: Dict[int, float] = {}
+        alpha_by_ell_mcc: Dict[int, float] = {}
         mu_units_by_ell: Dict[int, np.ndarray] = {}
 
         # Update min samples threshold from CLI
         global _MIN_SAMPLES_ALPHA
         _MIN_SAMPLES_ALPHA = getattr(args, "min_samples_alpha", 500)
-        alpha_method = getattr(args, "alpha_method", "mcculloch")
 
         summary_path = os.path.join(mdir, f"{model_name}_summary.csv")
         with open(summary_path, "w", newline="") as f:
             wcsv = csv.writer(f)
             wcsv.writerow([
                 "ell", "mu_l1_mean", "log_mu_l1_mean",
-                "alpha_hat", "sigma_alpha_hat",
-                "N_required_at_eps", "best_snr",
-                "err_at_best_snr", "best_N_for_ell",
-                "mbar_scalar", "alpha_reliable", "alpha_method", "n_samples",
+                "f_gates", "f_adapt",
+                "lambda_mean", "lambda_std",
+                "alpha_ecf", "sigma_ecf", "alpha_ecf_reliable",
+                "alpha_mcc", "sigma_mcc", "alpha_mcc_reliable",
+                "N_required_ecf", "best_snr_ecf", "err_at_best_snr_ecf", "best_N_ecf",
+                "N_required_mcc", "best_snr_mcc", "err_at_best_snr_mcc", "best_N_mcc",
+                "mbar_scalar", "n_samples",
             ])
 
             L = len(ells_list)
@@ -1351,10 +1671,25 @@ def run_for_model(args, model_name: str, mdir: str,
                     mu_mean = float(sum_mass[ell] / count_seq[ell])
                     log_mu_mean = float(sum_log_mass[ell] / count_seq[ell])
                     mu_per_unit = (sum_unit[ell] / count_seq[ell]).astype(np.float64)
+                    f_gates_ell = float(sum_mass_gates[ell] / count_seq[ell])
+                    f_adapt_ell = mu_mean - f_gates_ell
+                    # Per-lag adaptive base rate stats
+                    if count_lambda[ell] > 0:
+                        lam_m = sum_lambda_mean[ell] / count_lambda[ell]
+                        lam_sq_m = sum_lambda_sq[ell] / count_lambda[ell]
+                        lam_std = float(max(0.0, lam_sq_m - lam_m ** 2) ** 0.5)
+                        lam_mean_ell = float(lam_m)
+                    else:
+                        lam_mean_ell = float(args.lr)
+                        lam_std = 0.0
                 else:
                     mu_mean = 0.0
                     log_mu_mean = float("-inf")
                     mu_per_unit = np.zeros(Hdim, dtype=np.float64)
+                    f_gates_ell = 0.0
+                    f_adapt_ell = 0.0
+                    lam_mean_ell = float(args.lr)
+                    lam_std = 0.0
 
                 mu_by_ell[ell] = mu_mean
                 log_mu_by_ell[ell] = log_mu_mean
@@ -1364,38 +1699,71 @@ def run_for_model(args, model_name: str, mdir: str,
                 tmp_path = memmap_paths[ell]
                 T_seq = np.memmap(tmp_path, dtype=np.float64, mode="r", shape=(n_samples,))
 
+                _run_ecf = "ecf" in args.alpha_methods
+                _run_mcc = "mcc" in args.alpha_methods
+
                 if n_samples == 0:
-                    alpha_hat, sigma_hat, alpha_reliable = 2.0, 0.0, False
+                    alpha_ecf, sigma_ecf, rel_ecf = 2.0, 0.0, False
+                    alpha_mcc, sigma_mcc, rel_mcc = 2.0, 0.0, False
                     mbar = 0.0
                 else:
-                    alpha_hat, sigma_hat, alpha_reliable = estimate_alpha_sigma(
-                        np.asarray(T_seq), method=alpha_method
-                    )
-                    mean_raw = (sum_psi[ell] / max(1, count_psi[ell])) if count_psi[ell] > 0 else float(np.mean(T_seq))
+                    samples_arr = np.asarray(T_seq)
+                    if _run_ecf:
+                        alpha_ecf, sigma_ecf, rel_ecf = estimate_alpha_sigma(samples_arr, method="ecf")
+                    else:
+                        alpha_ecf, sigma_ecf, rel_ecf = float("nan"), float("nan"), False
+                    if _run_mcc:
+                        alpha_mcc, sigma_mcc, rel_mcc = estimate_alpha_sigma(samples_arr, method="mcculloch")
+                    else:
+                        alpha_mcc, sigma_mcc, rel_mcc = float("nan"), float("nan"), False
+                    mean_raw = (sum_psi[ell] / max(1, count_psi[ell])) if count_psi[ell] > 0 else float(np.mean(samples_arr))
                     mbar = float(abs(mean_raw))
 
-                alpha_by_ell[ell] = float(alpha_hat)
-                sigma_by_ell[ell] = float(sigma_hat)
+                alpha_by_ell_ecf[ell] = float(alpha_ecf)
+                alpha_by_ell_mcc[ell] = float(alpha_mcc)
 
-                best_snr, best_err, best_N, N_required = -1e18, 1e18, None, -1
-                for Nuse in args.N_grid:
-                    Nuse_eff = min(int(Nuse), max(1, n_samples))
-                    snr = compute_snr(alpha_hat, sigma_hat, mbar, Nuse_eff)
-                    if (snr > args.eps) and (N_required == -1):
-                        N_required = int(Nuse_eff)
-                    if snr > best_snr:
-                        best_snr = snr
-                        best_err = detection_error_on_prefix(T_seq, int(Nuse_eff)) if n_samples > 0 else float("nan")
-                        best_N = int(Nuse_eff)
+                # ECF-based detectability
+                best_snr_ecf_val, best_err_ecf, best_N_ecf, N_req_ecf = float("nan"), float("nan"), None, -1
+                if _run_ecf:
+                    best_snr_ecf_val = -1e18
+                    best_err_ecf = 1e18
+                    for Nuse in args.N_grid:
+                        Nuse_eff = min(int(Nuse), max(1, n_samples))
+                        snr = compute_snr(alpha_ecf, sigma_ecf, mbar, Nuse_eff)
+                        if (snr > args.eps) and (N_req_ecf == -1):
+                            N_req_ecf = int(Nuse_eff)
+                        if snr > best_snr_ecf_val:
+                            best_snr_ecf_val = snr
+                            best_err_ecf = detection_error_on_prefix(T_seq, int(Nuse_eff)) if n_samples > 0 else float("nan")
+                            best_N_ecf = int(Nuse_eff)
 
-                Nreq_by_ell[ell] = int(N_required)
+                # McCulloch-based detectability
+                best_snr_mcc_val, best_err_mcc, best_N_mcc, N_req_mcc = float("nan"), float("nan"), None, -1
+                if _run_mcc:
+                    best_snr_mcc_val = -1e18
+                    best_err_mcc = 1e18
+                    for Nuse in args.N_grid:
+                        Nuse_eff = min(int(Nuse), max(1, n_samples))
+                        snr = compute_snr(alpha_mcc, sigma_mcc, mbar, Nuse_eff)
+                        if (snr > args.eps) and (N_req_mcc == -1):
+                            N_req_mcc = int(Nuse_eff)
+                        if snr > best_snr_mcc_val:
+                            best_snr_mcc_val = snr
+                            best_err_mcc = detection_error_on_prefix(T_seq, int(Nuse_eff)) if n_samples > 0 else float("nan")
+                            best_N_mcc = int(Nuse_eff)
+
+                Nreq_by_ell_ecf[ell] = int(N_req_ecf)
+                Nreq_by_ell_mcc[ell] = int(N_req_mcc)
 
                 wcsv.writerow([
                     int(ell), float(mu_mean), float(log_mu_mean),
-                    float(alpha_hat), float(sigma_hat),
-                    int(N_required), float(best_snr),
-                    float(best_err), int(best_N if best_N is not None else -1),
-                    float(mbar), int(alpha_reliable), alpha_method, n_samples,
+                    float(f_gates_ell), float(f_adapt_ell),
+                    float(lam_mean_ell), float(lam_std),
+                    float(alpha_ecf), float(sigma_ecf), int(rel_ecf),
+                    float(alpha_mcc), float(sigma_mcc), int(rel_mcc),
+                    int(N_req_ecf), float(best_snr_ecf_val), float(best_err_ecf), int(best_N_ecf if best_N_ecf is not None else -1),
+                    int(N_req_mcc), float(best_snr_mcc_val), float(best_err_mcc), int(best_N_mcc if best_N_mcc is not None else -1),
+                    float(mbar), n_samples,
                 ])
 
                 del T_seq
@@ -1408,6 +1776,15 @@ def run_for_model(args, model_name: str, mdir: str,
             w.writerow(["ell"] + [f"mu_unit_{q}" for q in range(Hdim)])
             for e in sorted_ells:
                 w.writerow([int(e)] + [float(v) for v in mu_units_by_ell[e]])
+
+        # per-unit envelope decomposition: f_gates per unit
+        mu_units_gates_path = os.path.join(mdir, f"{model_name}_mu_units_gates.csv")
+        with open(mu_units_gates_path, "w", newline="") as f_gates_csv:
+            w = csv.writer(f_gates_csv)
+            w.writerow(["ell"] + [f"mu_gates_unit_{q}" for q in range(Hdim)])
+            for e in sorted_ells:
+                gates_unit = (sum_unit_gates[e] / max(1, count_seq[e])).astype(np.float64)
+                w.writerow([int(e)] + [float(v) for v in gates_unit])
 
         # per-unit tau fits (always create outputs)
         tau_list = []
@@ -1452,9 +1829,10 @@ def run_for_model(args, model_name: str, mdir: str,
             "ells": sorted_ells,
             "mu_by_ell": mu_by_ell,
             "log_mu_by_ell": log_mu_by_ell,
-            "Nreq_by_ell": Nreq_by_ell,
-            "alpha_by_ell": alpha_by_ell,
-            "sigma_by_ell": sigma_by_ell,
+            "Nreq_by_ell_ecf": Nreq_by_ell_ecf,
+            "Nreq_by_ell_mcc": Nreq_by_ell_mcc,
+            "alpha_by_ell_ecf": alpha_by_ell_ecf,
+            "alpha_by_ell_mcc": alpha_by_ell_mcc,
         }
 
     except Exception:
@@ -1498,8 +1876,11 @@ def parse_args():
                    help="Hidden-state dimensionality.")
 
     # --- Optimizer --------------------------------------------------------------
-    p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sgd", "sgd_momentum"])
+    p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sgd", "sgd_momentum", "rmsprop"])
     p.add_argument("--momentum", type=float, default=0.9)
+    p.add_argument("--rmsprop_alpha", type=float, default=0.99,
+                   help="Smoothing coefficient for RMSprop's running average of "
+                        "squared gradients (torch calls this 'alpha'). Default: 0.99.")
     p.add_argument("--epochs", type=int, default=400)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -1526,13 +1907,12 @@ def parse_args():
                    help="SNR detection threshold: lag is detectable when SNR > eps.")
 
     # --- Alpha estimation -------------------------------------------------------
-    p.add_argument("--alpha_method", type=str, default="mcculloch",
-                   choices=["mcculloch", "ecf"],
+    p.add_argument("--alpha_methods", type=str, default="ecf,mcc",
                    help=(
-                       "Method for estimating the stable tail index α̂. "
-                       "'mcculloch': McCulloch (1986) quantile ratio method. "
-                       "'ecf': Koutrouvelis (1980) ECF regression. "
-                       "Default: mcculloch."
+                       "Comma-separated list of alpha estimation methods to run. "
+                       "Choices: 'ecf' (Koutrouvelis 1980 ECF regression), "
+                       "'mcc' (McCulloch 1986 quantile method). "
+                       "Default: 'ecf,mcc' (both). Use 'ecf' or 'mcc' for a single method."
                    ))
     p.add_argument("--min_samples_alpha", type=int, default=500,
                    help=(
@@ -1586,6 +1966,14 @@ def parse_args():
     args.N_grid = [int(s) for s in args.N_grid.split(",") if s.strip() != ""]
 
     args.cuda_sync = bool(int(args.cuda_sync))
+
+    # Parse alpha methods set
+    _valid_alpha = {"ecf", "mcc"}
+    args.alpha_methods = {s.strip().lower() for s in args.alpha_methods.split(",") if s.strip()}
+    if not args.alpha_methods & _valid_alpha:
+        raise ValueError(f"--alpha_methods must contain at least one of {_valid_alpha}, got {args.alpha_methods}")
+    args.alpha_methods = args.alpha_methods & _valid_alpha
+
     return args
 
 def resolve_device(requested: str) -> torch.device:
@@ -1666,26 +2054,32 @@ def main():
             json.dump(fit_info, jf, indent=2)
 
         # Compute learnability window H_N = max detectable lag given N samples
-        H_by_N = compute_H_N(res["ells"], res["Nreq_by_ell"], args.N_grid)
+        H_by_N_ecf = compute_H_N(res["ells"], res["Nreq_by_ell_ecf"], args.N_grid)
+        H_by_N_mcc = compute_H_N(res["ells"], res["Nreq_by_ell_mcc"], args.N_grid)
+        res["H_by_N_ecf"] = H_by_N_ecf
+        res["H_by_N_mcc"] = H_by_N_mcc
+
         with open(os.path.join(mdir, f"{mname}_H_N.csv"), "w", newline="") as hf:
             wcsv = csv.writer(hf)
-            wcsv.writerow(["N", "H_N"])
-            for N, HN in sorted(H_by_N.items()):
-                wcsv.writerow([int(N), int(HN)])
-
-        res["H_by_N"] = H_by_N
+            wcsv.writerow(["N", "H_N_ecf", "H_N_mcc"])
+            for N in sorted(set(list(H_by_N_ecf.keys()) + list(H_by_N_mcc.keys()))):
+                wcsv.writerow([int(N), int(H_by_N_ecf.get(N, 0)), int(H_by_N_mcc.get(N, 0))])
         results.append(res)
 
         log(f"[main] done model={mname}")
 
-    # Write aggregate H_N summary: one row per N, one column per model
+    # Write aggregate H_N summary: one row per N, one column per model (both ECF and McCulloch)
     with open(os.path.join(args.outdir, "H_N_summary.csv"), "w", newline="") as hf:
         wcsv = csv.writer(hf)
-        wcsv.writerow(["N"] + [f"H_N_{m}" for m in models])
+        header = ["N"]
+        for m in models:
+            header += [f"H_N_{m}_ecf", f"H_N_{m}_mcc"]
+        wcsv.writerow(header)
         for N in args.N_grid:
             row = [int(N)]
             for res in results:
-                row.append(int(res["H_by_N"].get(int(N), 0)))
+                row.append(int(res["H_by_N_ecf"].get(int(N), 0)))
+                row.append(int(res["H_by_N_mcc"].get(int(N), 0)))
             wcsv.writerow(row)
 
     log(f"Done. Results saved to: {args.outdir}")

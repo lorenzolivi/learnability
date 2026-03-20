@@ -20,6 +20,20 @@ import matplotlib.pyplot as plt
 import seed_utils
 
 
+# ── Helper functions for dual-alpha format ──
+def _alpha_col(method):
+    """Return column name for alpha given method."""
+    return f"alpha_{method}"
+
+def _sigma_col(method):
+    """Return column name for sigma_alpha given method."""
+    return f"sigma_{method}"
+
+def _nreq_col(method):
+    """Return column name for N_required given method."""
+    return f"N_required_{method}"
+
+
 CANDIDATE_FILES = {
     "const": "const_summary.csv",
     "shared": "shared_summary.csv",
@@ -32,6 +46,7 @@ CANDIDATE_FILES = {
 def parse_args():
     p = argparse.ArgumentParser()
     seed_utils.add_multiseed_args(p)
+    seed_utils.add_view_arg(p)
     p.add_argument(
         "--outdir",
         type=str,
@@ -68,13 +83,44 @@ def kappa_from_alpha(a: np.ndarray) -> np.ndarray:
     return a / (a - 1.0)
 
 
-def load_summary(path: str) -> pd.DataFrame:
-    """Load and validate summary CSV."""
+def load_summary_from_df(df: pd.DataFrame, method: str = "ecf") -> pd.DataFrame:
+    """Extract method-specific columns from a summary DataFrame."""
+    alpha_col = _alpha_col(method)
+    sigma_col = _sigma_col(method)
+    nreq_col = _nreq_col(method)
+
+    # Try new format first
+    if alpha_col in df.columns:
+        result = df[["ell", "mu_l1_mean", alpha_col, sigma_col, nreq_col]].copy()
+        result.columns = ["ell", "mu_l1_mean", "alpha_hat", "sigma_alpha_hat", "N_required_at_eps"]
+    else:
+        # Old format
+        result = df[["ell", "mu_l1_mean", "alpha_hat", "sigma_alpha_hat", "N_required_at_eps"]].copy()
+
+    return result
+
+def load_summary(path: str, method: str = "ecf") -> pd.DataFrame:
+    """Load and validate summary CSV. Auto-detects old or new format."""
     df = pd.read_csv(path)
-    needed = ["ell", "mu_l1_mean", "alpha_hat", "sigma_alpha_hat", "N_required_at_eps"]
-    missing = [c for c in needed if c not in df.columns]
-    if missing:
-        raise ValueError(f"{path} missing columns: {missing}. Found: {list(df.columns)}")
+
+    # Determine which columns to expect based on format
+    alpha_col = _alpha_col(method)
+    sigma_col = _sigma_col(method)
+    nreq_col = _nreq_col(method)
+
+    # Try new format first
+    needed_new = ["ell", "mu_l1_mean", alpha_col, sigma_col, nreq_col]
+    cols_new = [c for c in needed_new if c in df.columns]
+
+    # Fall back to old format
+    if len(cols_new) < len(needed_new):
+        needed_old = ["ell", "mu_l1_mean", "alpha_hat", "sigma_alpha_hat", "N_required_at_eps"]
+        missing = [c for c in needed_old if c not in df.columns]
+        if missing:
+            raise ValueError(f"{path} missing columns: {missing}. Found: {list(df.columns)}")
+        agg_cols = ["mu_l1_mean", "alpha_hat", "sigma_alpha_hat", "N_required_at_eps"]
+    else:
+        agg_cols = ["mu_l1_mean", alpha_col, sigma_col, nreq_col]
 
     df = df.copy()
     df["ell"] = pd.to_numeric(df["ell"], errors="coerce")
@@ -82,7 +128,7 @@ def load_summary(path: str) -> pd.DataFrame:
     df["ell"] = df["ell"].astype(int)
 
     # If duplicates exist, average them (robustness)
-    agg_cols = ["mu_l1_mean", "alpha_hat", "sigma_alpha_hat", "N_required_at_eps"]
+    agg_cols = [c for c in agg_cols if c in df.columns]
     for c in agg_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.groupby("ell", as_index=False)[agg_cols].mean()
@@ -158,12 +204,163 @@ def aggregate_summaries_by_ell(
     return result.reset_index(drop=True).sort_values("ell")
 
 
+def _plot_envelope_eps_aggregated(summaries, ells, N_budgets, outpath, is_multiseed, method: str = "ecf"):
+    """Plot aggregated envelope + eps_th (mean ± std)."""
+    alpha_col = _alpha_col(method)
+    nreq_col = _nreq_col(method)
+
+    plt.figure(figsize=(7.4, 4.8))
+    for name, df in summaries.items():
+        f_hat = df["mu_l1_mean_mean"].to_numpy(dtype=float) if "mu_l1_mean_mean" in df.columns else df["mu_l1_mean"].to_numpy(dtype=float)
+        f_std = df["mu_l1_mean_std"].to_numpy(dtype=float) if "mu_l1_mean_std" in df.columns else None
+        color = seed_utils.get_model_color(name)
+        mask = np.isfinite(f_hat) & (f_hat > 0)
+        if np.any(mask):
+            line = plt.plot(ells[mask], f_hat[mask], marker="o", linewidth=2,
+                            label=rf"{name}: $\hat f(\ell)$", color=color)
+            if is_multiseed and f_std is not None:
+                plt.fill_between(ells[mask], f_hat[mask] - f_std[mask],
+                                 f_hat[mask] + f_std[mask], alpha=0.2, color=color)
+
+    for N in N_budgets:
+        for name, df in summaries.items():
+            f_hat = df["mu_l1_mean_mean"].to_numpy(dtype=float) if "mu_l1_mean_mean" in df.columns else df["mu_l1_mean"].to_numpy(dtype=float)
+            # Try method-specific columns first, fall back to old format
+            a_hat_col = f"{alpha_col}_mean" if f"{alpha_col}_mean" in df.columns else "alpha_hat_mean"
+            if a_hat_col not in df.columns:
+                a_hat_col = "alpha_hat"
+            nreq_col_with_mean = f"{nreq_col}_mean" if f"{nreq_col}_mean" in df.columns else "N_required_at_eps_mean"
+            if nreq_col_with_mean not in df.columns:
+                nreq_col_with_mean = "N_required_at_eps"
+
+            a_hat = df[a_hat_col].to_numpy(dtype=float) if a_hat_col in df.columns else df["alpha_hat"].to_numpy(dtype=float)
+            Nreq = df[nreq_col_with_mean].to_numpy(dtype=float) if nreq_col_with_mean in df.columns else df["N_required_at_eps"].to_numpy(dtype=float)
+            eps_th_vals = implied_eps_th(f_hat, Nreq, a_hat, N_budget=N)
+            mask = np.isfinite(eps_th_vals) & (eps_th_vals > 0)
+            if np.any(mask):
+                plt.plot(ells[mask], eps_th_vals[mask], linestyle="--", linewidth=1.6,
+                         label=rf"{name}: $\varepsilon_{{\mathrm{{th}}}}(\ell; N={N})$")
+
+    plt.yscale("log")
+    plt.xlabel(r"lag $\ell$")
+    plt.ylabel(r"Envelope / threshold level (log scale)")
+    plt.title(rf"Envelope $\hat f(\ell)$ and $\varepsilon_{{\mathrm{{th}}}}(\ell;N)$ [aggregated, {method}]")
+    plt.legend(fontsize=8, ncol=2)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=300)
+    plt.close()
+    print(f"[ok] saved: {outpath}")
+
+
+def _plot_sigma_aggregated(summaries, ells, outpath, is_multiseed, method: str = "ecf"):
+    """Plot aggregated sigma_alpha vs ell."""
+    sigma_col = _sigma_col(method)
+    plt.figure(figsize=(7.0, 4.2))
+    for name, df in summaries.items():
+        sig_col_with_mean = f"{sigma_col}_mean" if f"{sigma_col}_mean" in df.columns else "sigma_alpha_hat_mean"
+        if sig_col_with_mean not in df.columns:
+            sig_col_with_mean = "sigma_alpha_hat"
+
+        sig = df[sig_col_with_mean].to_numpy(dtype=float) if sig_col_with_mean in df.columns else df["sigma_alpha_hat"].to_numpy(dtype=float)
+
+        sig_std_col = f"{sigma_col}_std" if f"{sigma_col}_std" in df.columns else "sigma_alpha_hat_std"
+        sig_std = df[sig_std_col].to_numpy(dtype=float) if sig_std_col in df.columns else None
+
+        color = seed_utils.get_model_color(name)
+        mask = np.isfinite(sig) & (sig > 0)
+        if np.any(mask):
+            line = plt.plot(ells[mask], sig[mask], linewidth=2, label=name, color=color)
+            if is_multiseed and sig_std is not None:
+                plt.fill_between(ells[mask], np.maximum(sig[mask] - sig_std[mask], 1e-8),
+                                 sig[mask] + sig_std[mask], alpha=0.2, color=color)
+
+    plt.yscale("log")
+    plt.xlabel(r"lag $\ell$")
+    plt.ylabel(r"Estimated noise scale $\hat\sigma_\alpha(\ell)$ (log scale)")
+    plt.title(rf"Noise scale $\hat\sigma_\alpha(\ell)$ [aggregated, {method}]")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=300)
+    plt.close()
+    print(f"[ok] saved: {outpath}")
+
+
+def _plot_envelope_per_seed(seed_dirs, N_budgets, outpath):
+    """Plot per-seed envelope traces overlaid."""
+    plt.figure(figsize=(7.4, 4.8))
+    legend_handles = {}
+
+    for model in seed_utils.CANDIDATE_MODELS:
+        traces = seed_utils.load_model_data_per_seed(
+            seed_dirs, model, {"ell", "mu_l1_mean"})
+        if not traces:
+            continue
+        color = seed_utils.get_model_color(model)
+        for i, (seed_label, df) in enumerate(traces):
+            ell = df["ell"].to_numpy(dtype=float)
+            mu = df["mu_l1_mean"].to_numpy(dtype=float)
+            mask = np.isfinite(ell) & np.isfinite(mu) & (mu > 0)
+            if mask.sum() == 0:
+                continue
+            alpha = seed_utils.SEED_ALPHAS[i] if i < len(seed_utils.SEED_ALPHAS) else 0.3
+            line, = plt.plot(ell[mask], mu[mask], "-", color=color, alpha=alpha,
+                             linewidth=0.8)
+            if model not in legend_handles:
+                legend_handles[model] = line
+
+    plt.yscale("log")
+    plt.xlabel(r"lag $\ell$")
+    plt.ylabel(r"Envelope (log scale)")
+    plt.title(r"Envelope $\hat f(\ell)$ [per seed]")
+    if legend_handles:
+        plt.legend(legend_handles.values(), legend_handles.keys(), fontsize=8)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=300)
+    plt.close()
+    print(f"[ok] saved: {outpath}")
+
+
+def _plot_sigma_per_seed(seed_dirs, outpath):
+    """Plot per-seed sigma_alpha_hat traces overlaid."""
+    plt.figure(figsize=(7.0, 4.2))
+    legend_handles = {}
+
+    for model in seed_utils.CANDIDATE_MODELS:
+        traces = seed_utils.load_model_data_per_seed(
+            seed_dirs, model, {"ell", "sigma_alpha_hat"})
+        if not traces:
+            continue
+        color = seed_utils.get_model_color(model)
+        for i, (seed_label, df) in enumerate(traces):
+            ell = df["ell"].to_numpy(dtype=float)
+            sig = df["sigma_alpha_hat"].to_numpy(dtype=float)
+            mask = np.isfinite(ell) & np.isfinite(sig) & (sig > 0)
+            if mask.sum() == 0:
+                continue
+            alpha = seed_utils.SEED_ALPHAS[i] if i < len(seed_utils.SEED_ALPHAS) else 0.3
+            line, = plt.plot(ell[mask], sig[mask], "-", color=color, alpha=alpha,
+                             linewidth=0.8)
+            if model not in legend_handles:
+                legend_handles[model] = line
+
+    plt.yscale("log")
+    plt.xlabel(r"lag $\ell$")
+    plt.ylabel(r"$\hat\sigma_\alpha(\ell)$ (log scale)")
+    plt.title(r"Noise scale $\hat\sigma_\alpha(\ell)$ [per seed]")
+    if legend_handles:
+        plt.legend(legend_handles.values(), legend_handles.keys(), fontsize=8)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=300)
+    plt.close()
+    print(f"[ok] saved: {outpath}")
+
+
 def main():
     args = parse_args()
+    view = args.view
     outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
 
-    # Resolve input directories
     inputdirs = seed_utils.resolve_inputdirs(args)
     seed_dirs = seed_utils.discover_from_multiple_inputdirs(inputdirs)
 
@@ -171,187 +368,104 @@ def main():
         raise ValueError("No seed directories found (or inputdir not specified)")
 
     seed_utils.print_seed_info(seed_dirs, inputdirs)
+    print(f"[info] view mode: {view}")
 
     # Parse N budgets
     try:
         N_budgets = [int(s) for s in args.N_budgets.split(",") if s.strip()]
     except Exception as e:
-        raise ValueError(f"Could not parse --N_budgets='{args.N_budgets}'. Use e.g. '500,8000'.") from e
+        raise ValueError(f"Could not parse --N_budgets='{args.N_budgets}'.") from e
     if len(N_budgets) != 2:
         raise ValueError(f"--N_budgets must contain exactly two integers, got: {N_budgets}")
-
-    OUT_ENVELOPE_EPS = os.path.join(outdir, "envelope_with_eps_th.png")
-    OUT_SIGMA = os.path.join(outdir, "sigma_alpha_hat_vs_ell.png")
 
     print(f"[info] loading CSVs from: {', '.join(inputdirs)}")
     print(f"[info] saving figures to: {os.path.abspath(outdir)}")
     print(f"[info] N budgets: {N_budgets}")
 
-    # Load and aggregate summaries for each model
-    summaries = {}
-    for model in seed_utils.CANDIDATE_MODELS:
-        dfs = seed_utils.load_model_summary_across_seeds(seed_dirs, model)
-        if not dfs:
-            continue
+    # Detect which alpha methods are available
+    alpha_methods = ["ecf", "mcc"]  # Try both; fall back to old format if needed
 
-        # Load as summaries
-        loaded_dfs = []
-        for df in dfs:
-            loaded_dfs.append(df)
+    # Load and aggregate summaries for each model, detecting format
+    summaries_by_method = {}
+    for method in alpha_methods:
+        summaries = {}
+        for model in seed_utils.CANDIDATE_MODELS:
+            dfs = seed_utils.load_model_summary_across_seeds(seed_dirs, model)
+            if dfs:
+                # Reload with method parameter
+                dfs_method = []
+                for df in dfs:
+                    try:
+                        df_method = load_summary_from_df(df, method)
+                        dfs_method.append(df_method)
+                    except:
+                        pass
 
-        if loaded_dfs:
-            # Aggregate by ell
-            agg = aggregate_summaries_by_ell(loaded_dfs)
-            if not agg.empty:
-                summaries[model] = agg
+                if dfs_method:
+                    agg = aggregate_summaries_by_ell(dfs_method)
+                    if not agg.empty:
+                        summaries[model] = agg
 
-    if not summaries:
+        if summaries:
+            summaries_by_method[method] = summaries
+
+    if not summaries_by_method:
         raise FileNotFoundError("No model summary CSVs found in seed directories")
 
-    print(f"[info] found {len(summaries)} model(s): {', '.join(summaries.keys())}")
+    # Process each method separately
+    for method, summaries in summaries_by_method.items():
+        print(f"\n[info] processing alpha method: {method}")
+        print(f"[info] found {len(summaries)} model(s): {', '.join(summaries.keys())}")
 
-    # Build common ell grid (intersection) for aligned overlay plots
-    ell_sets = []
-    for name, df in summaries.items():
-        ell_sets.append(set(df["ell"].to_list()))
-    common_ells = sorted(set.intersection(*ell_sets))
-    if len(common_ells) == 0:
-        raise ValueError("No common 'ell' values across detected models (cannot align overlay plots).")
-    common_ells = np.array(common_ells, dtype=int)
+        # Build common ell grid
+        ell_sets = [set(df["ell"].to_list()) for df in summaries.values()]
+        common_ells = sorted(set.intersection(*ell_sets))
+        if not common_ells:
+            raise ValueError("No common 'ell' values across detected models.")
+        common_ells = np.array(common_ells, dtype=int)
 
-    # Restrict all summaries to common ell grid
-    for name in list(summaries.keys()):
-        summaries[name] = restrict_to_common_ell(summaries[name], common_ells)
+        for name in list(summaries.keys()):
+            summaries[name] = restrict_to_common_ell(summaries[name], common_ells)
 
-    ells = common_ells
-
-    # Check if we have multi-seed data (look for std columns)
-    is_multiseed = any(
-        f"{col}_std" in summaries[name].columns
-        for name in summaries
-        for col in ["mu_l1_mean", "sigma_alpha_hat"]
-    )
-
-    # ────────────────────────────────────────────────────────────────
-    # 1) Envelope + eps_th(ell; N) plot
-    # ────────────────────────────────────────────────────────────────
-    plt.figure(figsize=(7.4, 4.8))
-
-    # Envelope curves
-    for name, df in summaries.items():
-        f_hat = df["mu_l1_mean_mean"].to_numpy(dtype=float) if "mu_l1_mean_mean" in df.columns else df["mu_l1_mean"].to_numpy(dtype=float)
-        f_std = df["mu_l1_mean_std"].to_numpy(dtype=float) if "mu_l1_mean_std" in df.columns else None
-
-        mask = np.isfinite(f_hat) & (f_hat > 0)
-        if np.any(mask):
-            line = plt.plot(ells[mask], f_hat[mask], marker="o", linewidth=2, label=rf"{name}: $\hat f(\ell)$")
-            if is_multiseed and f_std is not None:
-                c = line[0].get_color()
-                f_std_masked = f_std[mask]
-                plt.fill_between(
-                    ells[mask],
-                    f_hat[mask] - f_std_masked,
-                    f_hat[mask] + f_std_masked,
-                    alpha=0.2,
-                    color=c
-                )
-        else:
-            print(f"[warn] {name}: no finite positive mu_l1_mean values to plot for envelope.")
-
-    # Threshold curves eps_th(ell; N)
-    for N in N_budgets:
-        for name, df in summaries.items():
-            f_hat = df["mu_l1_mean_mean"].to_numpy(dtype=float) if "mu_l1_mean_mean" in df.columns else df["mu_l1_mean"].to_numpy(dtype=float)
-            a_hat = df["alpha_hat_mean"].to_numpy(dtype=float) if "alpha_hat_mean" in df.columns else df["alpha_hat"].to_numpy(dtype=float)
-            Nreq = df["N_required_at_eps_mean"].to_numpy(dtype=float) if "N_required_at_eps_mean" in df.columns else df["N_required_at_eps"].to_numpy(dtype=float)
-            a_std = df["alpha_hat_std"].to_numpy(dtype=float) if "alpha_hat_std" in df.columns else None
-
-            eps_th = implied_eps_th(f_hat, Nreq, a_hat, N_budget=N)
-            mask = np.isfinite(eps_th) & (eps_th > 0)
-            if np.any(mask):
-                line = plt.plot(
-                    ells[mask],
-                    eps_th[mask],
-                    linestyle="--",
-                    linewidth=1.6,
-                    label=rf"{name}: $\varepsilon_{{\mathrm{{th}}}}(\ell; N={N})$",
-                )
-                if is_multiseed and a_std is not None:
-                    # Propagate uncertainty through eps_th formula
-                    c = line[0].get_color()
-                    # Simple approximation: use alpha uncertainty
-                    eps_th_plus = implied_eps_th(f_hat, Nreq, a_hat + a_std, N_budget=N)
-                    eps_th_minus = implied_eps_th(f_hat, Nreq, a_hat - a_std, N_budget=N)
-                    plt.fill_between(
-                        ells[mask],
-                        eps_th_minus[mask],
-                        eps_th_plus[mask],
-                        alpha=0.15,
-                        color=c
-                    )
-            else:
-                print(f"[warn] {name}: no valid eps_th values for N={N} (skipping threshold curve).")
-
-    plt.yscale("log")
-    plt.xlabel(r"lag $\ell$")
-    plt.ylabel(r"Envelope / threshold level (log scale)")
-    plt.title(r"Envelope $\hat f(\ell)$ and detectability threshold $\varepsilon_{\mathrm{th}}(\ell;N)$")
-    plt.legend(fontsize=8, ncol=2)
-    plt.tight_layout()
-    plt.savefig(OUT_ENVELOPE_EPS, dpi=300)
-    plt.close()
-
-    # ────────────────────────────────────────────────────────────────
-    # 2) sigma_alpha_hat(ell) vs ell plot
-    # ────────────────────────────────────────────────────────────────
-    plt.figure(figsize=(7.0, 4.2))
-
-    for name, df in summaries.items():
-        sig = df["sigma_alpha_hat_mean"].to_numpy(dtype=float) if "sigma_alpha_hat_mean" in df.columns else df["sigma_alpha_hat"].to_numpy(dtype=float)
-        sig_std = df["sigma_alpha_hat_std"].to_numpy(dtype=float) if "sigma_alpha_hat_std" in df.columns else None
-
-        mask = np.isfinite(sig) & (sig > 0)
-        if np.any(mask):
-            line = plt.plot(ells[mask], sig[mask], linewidth=2, label=name)
-            if is_multiseed and sig_std is not None:
-                c = line[0].get_color()
-                sig_std_masked = sig_std[mask]
-                plt.fill_between(
-                    ells[mask],
-                    np.maximum(sig[mask] - sig_std_masked, 1e-8),
-                    sig[mask] + sig_std_masked,
-                    alpha=0.2,
-                    color=c
-                )
-        else:
-            print(f"[warn] {name}: no finite positive sigma_alpha_hat values to plot.")
-
-    plt.yscale("log")
-    plt.xlabel(r"lag $\ell$")
-    plt.ylabel(r"Estimated noise scale $\hat\sigma_\alpha(\ell)$ (log scale)")
-    plt.title(r"Estimated noise scale $\hat\sigma_\alpha(\ell)$ across diagnostic lags")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(OUT_SIGMA, dpi=300)
-    plt.close()
-
-    print(f"[ok] Saved: {OUT_ENVELOPE_EPS}")
-    print(f"[ok] Saved: {OUT_SIGMA}")
-
-    # Optional summary printout
-    for name, df in summaries.items():
-        a = safe_alpha(
-            df["alpha_hat_mean"].to_numpy(dtype=float) if "alpha_hat_mean" in df.columns else df["alpha_hat"].to_numpy(dtype=float)
+        ells = common_ells
+        is_multiseed = any(
+            f"{col}_std" in summaries[name].columns
+            for name in summaries
+            for col in ["mu_l1_mean", "sigma_alpha_hat"]
         )
-        sig = df["sigma_alpha_hat_mean"].to_numpy(dtype=float) if "sigma_alpha_hat_mean" in df.columns else df["sigma_alpha_hat"].to_numpy(dtype=float)
-        sig = sig[np.isfinite(sig) & (sig > 0)]
-        if sig.size:
-            print(
-                f"{name}: alpha_mean={np.mean(a):.3f}, alpha_median={np.median(a):.3f}, "
-                f"sigma_median={np.median(sig):.3e}"
+
+        method_tag = f"_{method}" if len(summaries_by_method) > 1 else ""
+        tag = "agg_" if view == "both" else ""
+        ps_tag = "ps_" if view == "both" else ""
+
+        # ── AGGREGATED VIEW ──
+        if view in ("aggregated", "both"):
+            _plot_envelope_eps_aggregated(summaries, ells, N_budgets,
+                                          os.path.join(outdir, f"{tag}envelope_with_eps_th{method_tag}.png"),
+                                          is_multiseed, method=method)
+            _plot_sigma_aggregated(summaries, ells,
+                                   os.path.join(outdir, f"{tag}sigma_alpha_hat_vs_ell{method_tag}.png"),
+                                   is_multiseed, method=method)
+
+        # ── PER-SEED VIEW ──
+        if view in ("per_seed", "both"):
+            _plot_envelope_per_seed(seed_dirs, N_budgets,
+                                    os.path.join(outdir, f"{ps_tag}envelope_with_eps_th{method_tag}.png"))
+            _plot_sigma_per_seed(seed_dirs,
+                                 os.path.join(outdir, f"{ps_tag}sigma_alpha_hat_vs_ell{method_tag}.png"))
+
+        # Summary printout
+        for name, df in summaries.items():
+            a = safe_alpha(
+                df["alpha_hat_mean"].to_numpy(dtype=float) if "alpha_hat_mean" in df.columns else df["alpha_hat"].to_numpy(dtype=float)
             )
-        else:
-            print(f"{name}: alpha_mean={np.mean(a):.3f}, alpha_median={np.median(a):.3f}, sigma_median=NA")
+            sig = df["sigma_alpha_hat_mean"].to_numpy(dtype=float) if "sigma_alpha_hat_mean" in df.columns else df["sigma_alpha_hat"].to_numpy(dtype=float)
+            sig = sig[np.isfinite(sig) & (sig > 0)]
+            if sig.size:
+                print(f"{name}: alpha_mean={np.mean(a):.3f}, alpha_median={np.median(a):.3f}, "
+                      f"sigma_median={np.median(sig):.3e}")
+            else:
+                print(f"{name}: alpha_mean={np.mean(a):.3f}, alpha_median={np.median(a):.3f}, sigma_median=NA")
 
 
 if __name__ == "__main__":

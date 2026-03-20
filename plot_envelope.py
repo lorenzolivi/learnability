@@ -65,6 +65,7 @@ import seed_utils
 def parse_args():
     p = argparse.ArgumentParser()
     seed_utils.add_multiseed_args(p)
+    seed_utils.add_view_arg(p)
     p.add_argument("--outdir", type=str, default=".", help="Directory where figures will be saved (default: .)")
     p.add_argument(
         "--grid_mode",
@@ -414,16 +415,37 @@ def fit_tempered_powerlaw(ells: np.ndarray, f_pos: np.ndarray, eps: float,
     }
 
 
-def plot_curves(x: np.ndarray,
-                series_dict: dict,
-                xlabel: str,
-                ylabel: str,
-                title: str,
-                outpath: str,
-                fit_overlays: dict = None,
-                fit_x_mode: str = "linear",
-                show_fits: bool = False) -> None:
-    """Plot curves with optional fit overlays."""
+def _overlay_fit(ax, x, mask, fd, fit_x_mode):
+    """Overlay a fitted trend line on an axis."""
+    if fd is None:
+        return
+    ell_min = float(fd["ell_min"])
+    ell_max = float(fd["ell_max"])
+    if fit_x_mode == "linear":
+        x_fit = x[mask]
+        x_fit = x_fit[(x_fit >= ell_min) & (x_fit <= ell_max)]
+        if x_fit.size >= 2:
+            y_fit = float(fd["a"]) + float(fd["b"]) * x_fit
+            ax.plot(x_fit, y_fit, ":", color="black", linewidth=1.5)
+    elif fit_x_mode == "log":
+        lo, hi = np.log(ell_min), np.log(ell_max)
+        x_fit = x[mask]
+        x_fit = x_fit[(x_fit >= lo) & (x_fit <= hi)]
+        if x_fit.size >= 2:
+            y_fit = float(fd["a"]) + float(fd["b"]) * x_fit
+            ax.plot(x_fit, y_fit, ":", color="black", linewidth=1.5)
+
+
+def plot_curves_aggregated(x: np.ndarray,
+                           series_dict: dict,
+                           xlabel: str,
+                           ylabel: str,
+                           title: str,
+                           outpath: str,
+                           fit_overlays: dict = None,
+                           fit_x_mode: str = "linear",
+                           show_fits: bool = False) -> None:
+    """Plot aggregated curves (mean ± std) with optional fit overlays."""
     plt.figure(figsize=(6, 4))
     plotted = False
 
@@ -440,36 +462,19 @@ def plot_curves(x: np.ndarray,
             print(f"[warn] {label}: no valid points for {os.path.basename(outpath)}")
             continue
 
-        # Check if single-seed (std all zero or NaN)
         is_single_seed = np.all((np.isnan(y_std) | (y_std == 0)))
+        color = seed_utils.get_model_color(label)
 
         if is_single_seed:
-            plt.plot(x_[mask], y_mean[mask], "-", label=label)
+            plt.plot(x_[mask], y_mean[mask], "-", label=label, color=color)
         else:
-            seed_utils.shade_between(plt.gca(), x_[mask], y_mean[mask], y_std[mask], label=label)
+            seed_utils.shade_between(plt.gca(), x_[mask], y_mean[mask], y_std[mask],
+                                     label=label, color=color)
 
         plotted = True
 
-        # Plot fit overlay
-        if show_fits and fit_overlays is not None and label in fit_overlays and fit_overlays[label] is not None:
-            fd = fit_overlays[label]
-            ell_min = float(fd["ell_min"])
-            ell_max = float(fd["ell_max"])
-
-            if fit_x_mode == "linear":
-                x_fit = x_[mask]
-                x_fit = x_fit[(x_fit >= ell_min) & (x_fit <= ell_max)]
-                if x_fit.size >= 2:
-                    y_fit = float(fd["a"]) + float(fd["b"]) * x_fit
-                    plt.plot(x_fit, y_fit, ":", color="black", linewidth=1.5)
-            elif fit_x_mode == "log":
-                lo = np.log(ell_min)
-                hi = np.log(ell_max)
-                x_fit = x_[mask]
-                x_fit = x_fit[(x_fit >= lo) & (x_fit <= hi)]
-                if x_fit.size >= 2:
-                    y_fit = float(fd["a"]) + float(fd["b"]) * x_fit
-                    plt.plot(x_fit, y_fit, ":", color="black", linewidth=1.5)
+        if show_fits and fit_overlays is not None and label in fit_overlays:
+            _overlay_fit(plt.gca(), x_, mask, fit_overlays[label], fit_x_mode)
 
     if not plotted:
         print(f"[warn] no curves plotted for {os.path.basename(outpath)}")
@@ -486,10 +491,69 @@ def plot_curves(x: np.ndarray,
     print(f"[ok] saved: {outpath}")
 
 
+def plot_curves_per_seed(x_grid: np.ndarray,
+                         per_seed_data: dict,
+                         xlabel: str,
+                         ylabel: str,
+                         title: str,
+                         outpath: str,
+                         transform=None,
+                         fit_overlays: dict = None,
+                         fit_x_mode: str = "linear",
+                         show_fits: bool = False) -> None:
+    """
+    Plot individual seed traces overlaid.
+
+    per_seed_data: { model: [ (seed_label, ell_array, y_array), ... ] }
+    transform: optional callable applied to (ell, y) -> (x, y_transformed)
+    """
+    plt.figure(figsize=(6, 4))
+    plotted = False
+    legend_handles = {}
+
+    for model, seed_traces in per_seed_data.items():
+        color = seed_utils.get_model_color(model)
+        for i, (seed_label, ell, y) in enumerate(seed_traces):
+            if transform is not None:
+                x_plot, y_plot = transform(ell, y)
+            else:
+                x_plot, y_plot = ell, y
+
+            mask = np.isfinite(x_plot) & np.isfinite(y_plot)
+            if mask.sum() == 0:
+                continue
+
+            alpha = seed_utils.SEED_ALPHAS[i] if i < len(seed_utils.SEED_ALPHAS) else 0.3
+            line, = plt.plot(x_plot[mask], y_plot[mask], "-", color=color,
+                             alpha=alpha, linewidth=0.8)
+            if model not in legend_handles:
+                legend_handles[model] = line
+            plotted = True
+
+        if show_fits and fit_overlays is not None and model in fit_overlays:
+            _overlay_fit(plt.gca(), x_grid, np.ones(len(x_grid), dtype=bool),
+                         fit_overlays[model], fit_x_mode)
+
+    if not plotted:
+        print(f"[warn] no curves plotted for {os.path.basename(outpath)}")
+        plt.close()
+        return
+
+    plt.legend(legend_handles.values(), legend_handles.keys())
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=300)
+    plt.close()
+    print(f"[ok] saved: {outpath}")
+
+
 # ── Main ───────────────────────────────────────────────────
 
 def main():
     args = parse_args()
+    view = args.view
 
     # Resolve input directories and discover seed dirs
     inputdirs = seed_utils.resolve_inputdirs(args)
@@ -504,8 +568,9 @@ def main():
 
     seed_utils.print_seed_info(seed_dirs, inputdirs)
     print(f"[info] saving figures to: {os.path.abspath(outdir)}")
+    print(f"[info] view mode: {view}")
 
-    # Load and aggregate model data across seeds
+    # ── Load aggregated data (for aggregated view and fits) ──────────
     print("[info] loading and aggregating model summaries across seeds...")
     model_data = {}
     for model in CANDIDATE_MODELS:
@@ -522,6 +587,20 @@ def main():
         )
 
     print(f"[info] found {len(model_data)} model(s): {', '.join(model_data.keys())}")
+
+    # ── Load per-seed data (for per_seed view) ──────────────────────
+    per_seed_raw = {}  # { model: [(seed_label, ell, mu), ...] }
+    if view in ("per_seed", "both"):
+        print("[info] loading per-seed traces...")
+        for model in model_data.keys():
+            traces = seed_utils.load_model_data_per_seed(seed_dirs, model, REQUIRED_COLS)
+            per_seed_raw[model] = []
+            for seed_label, df in traces:
+                ell = df["ell"].to_numpy(dtype=float)
+                mu = df["mu_l1_mean"].to_numpy(dtype=float)
+                mask = np.isfinite(ell) & np.isfinite(mu) & (ell > 0) & (mu > 0)
+                per_seed_raw[model].append((seed_label, ell[mask], mu[mask]))
+            print(f"  - {model}: {len(per_seed_raw[model])} seed trace(s)")
 
     # Build ell grid
     ell_sets = []
@@ -546,11 +625,9 @@ def main():
     f = {}
     f_std = {}
     for model, data in model_data.items():
-        # Interpolate mean
         mu = np.interp(ells, data["ell"], data["mu_mean"], left=np.nan, right=np.nan)
         f[model] = mu
 
-        # Interpolate std (or zeros if single-seed)
         is_single_seed = np.all((np.isnan(data["mu_std"]) | (data["mu_std"] == 0)))
         if is_single_seed:
             f_std[model] = np.zeros_like(mu)
@@ -592,7 +669,7 @@ def main():
     # Build clamped log f(ell)
     log_f = {model: clamp_log(y, eps=eps[model]) for model, y in f.items()}
 
-    # Fits
+    # ── Fits (on seed-averaged envelope) ────────────────────────────
     show_fits = bool(int(args.show_fits) == 1)
     do_tempered = bool(int(args.fit_tempered) == 1)
 
@@ -697,45 +774,100 @@ def main():
                 json.dump(fits_out, fjson, indent=2)
             print(f"[ok] saved fits: {fits_path}")
 
-    # Plot 1: Linear-scale envelope f(ell)
-    series_lin = {model: {"y_mean": f[model], "y_std": f_std[model]} for model in f}
-    plot_curves(
-        ells,
-        series_lin,
-        xlabel=r"lag $\ell$",
-        ylabel=r"$\hat{f}(\ell)$",
-        title=r"Envelope scaling $\hat{f}(\ell)$",
-        outpath=os.path.join(outdir, "envelope_mu_vs_ell.png"),
-        show_fits=False,
-    )
+    # ── AGGREGATED VIEW ─────────────────────────────────────────────
+    if view in ("aggregated", "both"):
+        tag = "agg_" if view == "both" else ""
 
-    # Plot 2: Semi-log: log f(ell) vs ell (+ exp fit overlay)
-    series_semilog = {model: {"y_mean": log_f[model], "y_std": f_std[model] / np.maximum(np.abs(f[model]), 1e-10)} for model in f}
-    plot_curves(
-        ells,
-        series_semilog,
-        xlabel=r"lag $\ell$",
-        ylabel=r"$\log \hat{f}(\ell)$",
-        title=r"Envelope scaling $\log \hat{f}(\ell)$",
-        outpath=os.path.join(outdir, "log_envelope_vs_ell.png"),
-        fit_overlays=exp_fits if show_fits else None,
-        fit_x_mode="linear",
-        show_fits=show_fits,
-    )
+        series_lin = {model: {"y_mean": f[model], "y_std": f_std[model]} for model in f}
+        plot_curves_aggregated(
+            ells, series_lin,
+            xlabel=r"lag $\ell$",
+            ylabel=r"$\hat{f}(\ell)$",
+            title=r"Envelope scaling $\hat{f}(\ell)$ [aggregated]",
+            outpath=os.path.join(outdir, f"{tag}envelope_mu_vs_ell.png"),
+            show_fits=False,
+        )
 
-    # Plot 3: Log-log: log f(ell) vs log ell (+ power fit overlay)
-    series_loglog = {model: {"y_mean": log_f[model], "y_std": f_std[model] / np.maximum(np.abs(f[model]), 1e-10)} for model in f}
-    plot_curves(
-        log_ells,
-        series_loglog,
-        xlabel=r"$\log \ell$",
-        ylabel=r"$\log \hat{f}(\ell)$",
-        title=r"Envelope scaling $\log \hat{f}(\ell)$ vs $\log \ell$",
-        outpath=os.path.join(outdir, "log_envelope_vs_log_ell.png"),
-        fit_overlays=pow_fits if show_fits else None,
-        fit_x_mode="log",
-        show_fits=show_fits,
-    )
+        series_semilog = {model: {"y_mean": log_f[model],
+                                   "y_std": f_std[model] / np.maximum(np.abs(f[model]), 1e-10)}
+                          for model in f}
+        plot_curves_aggregated(
+            ells, series_semilog,
+            xlabel=r"lag $\ell$",
+            ylabel=r"$\log \hat{f}(\ell)$",
+            title=r"Envelope scaling $\log \hat{f}(\ell)$ [aggregated]",
+            outpath=os.path.join(outdir, f"{tag}log_envelope_vs_ell.png"),
+            fit_overlays=exp_fits if show_fits else None,
+            fit_x_mode="linear",
+            show_fits=show_fits,
+        )
+
+        series_loglog = {model: {"y_mean": log_f[model],
+                                  "y_std": f_std[model] / np.maximum(np.abs(f[model]), 1e-10)}
+                         for model in f}
+        plot_curves_aggregated(
+            log_ells, series_loglog,
+            xlabel=r"$\log \ell$",
+            ylabel=r"$\log \hat{f}(\ell)$",
+            title=r"Envelope scaling $\log \hat{f}(\ell)$ vs $\log \ell$ [aggregated]",
+            outpath=os.path.join(outdir, f"{tag}log_envelope_vs_log_ell.png"),
+            fit_overlays=pow_fits if show_fits else None,
+            fit_x_mode="log",
+            show_fits=show_fits,
+        )
+
+    # ── PER-SEED VIEW ───────────────────────────────────────────────
+    if view in ("per_seed", "both") and per_seed_raw:
+        tag = "ps_" if view == "both" else ""
+
+        # Linear scale
+        plot_curves_per_seed(
+            ells, per_seed_raw,
+            xlabel=r"lag $\ell$",
+            ylabel=r"$\hat{f}(\ell)$",
+            title=r"Envelope scaling $\hat{f}(\ell)$ [per seed]",
+            outpath=os.path.join(outdir, f"{tag}envelope_mu_vs_ell.png"),
+            show_fits=False,
+        )
+
+        # Semi-log: log f vs ell
+        def _semilog_transform(ell, mu):
+            log_mu = np.full_like(mu, np.nan)
+            pos = mu > 0
+            log_mu[pos] = np.log(mu[pos])
+            return ell, log_mu
+
+        plot_curves_per_seed(
+            ells, per_seed_raw,
+            xlabel=r"lag $\ell$",
+            ylabel=r"$\log \hat{f}(\ell)$",
+            title=r"Envelope scaling $\log \hat{f}(\ell)$ [per seed]",
+            outpath=os.path.join(outdir, f"{tag}log_envelope_vs_ell.png"),
+            transform=_semilog_transform,
+            fit_overlays=exp_fits if show_fits else None,
+            fit_x_mode="linear",
+            show_fits=show_fits,
+        )
+
+        # Log-log: log f vs log ell
+        def _loglog_transform(ell, mu):
+            log_mu = np.full_like(mu, np.nan)
+            pos = mu > 0
+            log_mu[pos] = np.log(mu[pos])
+            log_ell = np.log(ell)
+            return log_ell, log_mu
+
+        plot_curves_per_seed(
+            log_ells, per_seed_raw,
+            xlabel=r"$\log \ell$",
+            ylabel=r"$\log \hat{f}(\ell)$",
+            title=r"Envelope scaling $\log \hat{f}(\ell)$ vs $\log \ell$ [per seed]",
+            outpath=os.path.join(outdir, f"{tag}log_envelope_vs_log_ell.png"),
+            transform=_loglog_transform,
+            fit_overlays=pow_fits if show_fits else None,
+            fit_x_mode="log",
+            show_fits=show_fits,
+        )
 
 
 if __name__ == "__main__":

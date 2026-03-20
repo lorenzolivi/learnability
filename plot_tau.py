@@ -28,6 +28,7 @@ def parse_args():
 
     # Multi-seed arguments
     seed_utils.add_multiseed_args(p)
+    seed_utils.add_view_arg(p)
     p.add_argument("--outdir", type=str, default="figures", help="Output folder (default: figures)")
 
     p.add_argument("--min_points", type=int, default=3,
@@ -93,6 +94,7 @@ def kde_1d(x, grid):
 
     std = np.std(x, ddof=1)
     iqr = np.subtract(*np.percentile(x, [75, 25]))
+    # Silverman's rule of thumb: bandwidth h = 0.9 * min(σ, IQR/1.349) * n^{-1/5}
     sigma = min(std, iqr / 1.349) if (std > 0 and iqr > 0) else (std if std > 0 else 1.0)
     h = max(0.9 * sigma * n ** (-1 / 5), 1e-6)
 
@@ -119,7 +121,7 @@ def estimate_tau_from_mu_units(path, min_points=3, mu_floor=1e-300):
     if df is None or df.shape[1] < 2:
         return np.array([], dtype=float)
 
-    ell_col = df.columns[0]
+    ell_col = "ell" if "ell" in df.columns else df.columns[0]
     ell = pd.to_numeric(df[ell_col], errors="coerce").to_numpy(dtype=float)
     units = df.drop(columns=[ell_col]).apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
 
@@ -430,8 +432,125 @@ def plot_single_model_pdf(tau_raw, title, outfile, args):
     print(f"[ok] saved: {outfile}")
 
 
+def load_tau_mu_per_seed(seed_dirs, model, args):
+    """Load tau from mu units per-seed (not pooled). Returns [(seed_label, array), ...]."""
+    result = []
+    for indir in seed_dirs:
+        seed_label = seed_utils.get_seed_label(indir)
+        taus = None
+
+        tau_file = seed_utils.find_file_in_seed_dir(indir, f"{model}_tau_from_mu_units.csv", model)
+        if tau_file is not None:
+            df = _safe_read_csv(tau_file)
+            if df is not None:
+                for col_name in ["tau", "tau_mu"]:
+                    if col_name in df.columns:
+                        taus = df[col_name].to_numpy(dtype=float)
+                        break
+
+        if taus is None:
+            mu_units = seed_utils.find_file_in_seed_dir(indir, f"{model}_mu_units.csv", model)
+            if mu_units is not None:
+                taus = estimate_tau_from_mu_units(mu_units, min_points=args.min_points,
+                                                  mu_floor=args.mu_floor)
+
+        if taus is not None and np.asarray(taus).size > 0:
+            result.append((seed_label, np.asarray(taus, dtype=float)))
+
+    return result
+
+
+def plot_overlay_pdf_per_seed(all_taus_per_seed, title, outfile, args):
+    """Plot per-seed KDE traces overlaid.
+
+    all_taus_per_seed: {model: [(seed_label, array), ...]}
+    """
+    fig, ax = plt.subplots(figsize=(7.6, 4.8))
+
+    # Get global range from all data
+    pooled = []
+    for model, seed_traces in all_taus_per_seed.items():
+        for _, tau in seed_traces:
+            cleaned = _clean_tau(tau, cap_percentile=float(args.cap_percentile))
+            if cleaned.size > 0:
+                pooled.append(cleaned)
+
+    if not pooled:
+        print(f"[warn] no τ values for per-seed plot: {outfile}")
+        plt.close(fig)
+        return
+
+    all_pooled = np.concatenate(pooled)
+    xmin = float(np.min(all_pooled))
+    xmax = float(np.max(all_pooled))
+    pad = 0.02 * (xmax - xmin) if xmax > xmin else 0.0
+    grid = np.linspace(max(0.0, xmin - pad), xmax + pad, int(args.kde_grid))
+
+    legend_handles = {}
+    for model, seed_traces in all_taus_per_seed.items():
+        color = seed_utils.get_model_color(model)
+        for i, (seed_label, tau_raw) in enumerate(seed_traces):
+            tau = _clean_tau(tau_raw, cap_percentile=float(args.cap_percentile))
+            if tau.size < 2:
+                continue
+            alpha = seed_utils.SEED_ALPHAS[i] if i < len(seed_utils.SEED_ALPHAS) else 0.3
+            dens = kde_1d(tau, grid)
+            line, = ax.plot(grid, dens, linewidth=0.8, color=color, alpha=alpha)
+            if model not in legend_handles:
+                legend_handles[model] = line
+
+    if args.logx:
+        ax.set_xscale("log")
+    ax.set_xlabel(r"$\tau_q$")
+    ax.set_ylabel("density")
+    ax.set_title(title + " (PDF) [per seed]")
+    if legend_handles:
+        ax.legend(legend_handles.values(), legend_handles.keys(), fontsize=8)
+    fig.tight_layout()
+    fig.savefig(outfile, dpi=300)
+    plt.close(fig)
+    print(f"[ok] saved: {outfile}")
+
+
+def plot_overlay_ccdf_per_seed(all_taus_per_seed, title, outfile, args):
+    """Plot per-seed CCDF traces overlaid."""
+    fig, ax = plt.subplots(figsize=(7.6, 4.8))
+    legend_handles = {}
+
+    for model, seed_traces in all_taus_per_seed.items():
+        color = seed_utils.get_model_color(model)
+        for i, (seed_label, tau_raw) in enumerate(seed_traces):
+            tau = _clean_tau(tau_raw, cap_percentile=float(args.cap_percentile))
+            if tau.size < 2:
+                continue
+            alpha_val = seed_utils.SEED_ALPHAS[i] if i < len(seed_utils.SEED_ALPHAS) else 0.3
+            tau_sorted = np.sort(tau)
+            n = tau_sorted.size
+            ccdf = 1.0 - np.arange(1, n + 1) / n
+            if args.logy:
+                ccdf = np.maximum(ccdf, 1.0 / (n + 1))
+            line, = ax.plot(tau_sorted, ccdf, linewidth=0.8, color=color, alpha=alpha_val)
+            if model not in legend_handles:
+                legend_handles[model] = line
+
+    if args.logx:
+        ax.set_xscale("log")
+    if args.logy:
+        ax.set_yscale("log")
+    ax.set_xlabel(r"$\tau_q$")
+    ax.set_ylabel("P(T ≥ τ)")
+    ax.set_title(title + " (CCDF) [per seed]")
+    if legend_handles:
+        ax.legend(legend_handles.values(), legend_handles.keys(), fontsize=8)
+    fig.tight_layout()
+    fig.savefig(outfile, dpi=300)
+    plt.close(fig)
+    print(f"[ok] saved: {outfile}")
+
+
 def main():
     args = parse_args()
+    view = args.view
 
     # Resolve input directories and discover seed directories
     inputdirs = seed_utils.resolve_inputdirs(args)
@@ -457,8 +576,8 @@ def main():
             print("[info] --ccdf ignored in --separate mode (separate uses PDF only).")
             args.ccdf = False
 
-    # Print seed information
     seed_utils.print_seed_info(seed_dirs, inputdirs)
+    print(f"[info] view mode: {view}")
 
     models = detect_models(seed_dirs)
     if not models:
@@ -467,80 +586,78 @@ def main():
     print(f"[info] outdir:   {os.path.abspath(args.outdir)}")
     print(f"[info] detected models: {models}")
 
+    # Load pooled tau data
     tau_mu_all = {}
     tau_gate_all = {}
-
     for m in models:
         tau_mu = load_tau_mu(seed_dirs, m, args)
         tau_gate = load_tau_gate(seed_dirs, m)
-
         if tau_mu is not None and np.asarray(tau_mu).size:
             tau_mu_all[m] = np.asarray(tau_mu, dtype=float)
         if tau_gate is not None and np.asarray(tau_gate).size:
             tau_gate_all[m] = np.asarray(tau_gate, dtype=float)
 
-    n_seeds = len(seed_dirs)
+    # Load per-seed tau data
+    tau_mu_per_seed = {}
+    if view in ("per_seed", "both"):
+        for m in models:
+            traces = load_tau_mu_per_seed(seed_dirs, m, args)
+            if traces:
+                tau_mu_per_seed[m] = traces
 
-    if not args.separate:
+    n_seeds = len(seed_dirs)
+    tag = "agg_" if view == "both" else ""
+    ps_tag = "ps_" if view == "both" else ""
+
+    # ── AGGREGATED VIEW ──
+    if view in ("aggregated", "both") and not args.separate:
         if tau_gate_all:
             if args.ccdf:
-                plot_overlay_ccdf(
-                    tau_gate_all,
-                    title="Time-scale distribution (gate-derived)",
-                    outfile=os.path.join(args.outdir, "tau_ccdf_gate_all.png"),
-                    args=args,
-                    n_seeds=n_seeds,
-                )
+                plot_overlay_ccdf(tau_gate_all, title="Time-scale distribution (gate-derived)",
+                                  outfile=os.path.join(args.outdir, f"{tag}tau_ccdf_gate_all.png"),
+                                  args=args, n_seeds=n_seeds)
             else:
-                plot_overlay_pdf(
-                    tau_gate_all,
-                    title="Time-scale distribution (gate-derived)",
-                    outfile=os.path.join(args.outdir, "tau_pdf_gate_all.png"),
-                    args=args,
-                    n_seeds=n_seeds,
-                )
-        else:
-            print("[info] no gate-derived τ distributions found.")
+                plot_overlay_pdf(tau_gate_all, title="Time-scale distribution (gate-derived)",
+                                 outfile=os.path.join(args.outdir, f"{tag}tau_pdf_gate_all.png"),
+                                 args=args, n_seeds=n_seeds)
 
         if tau_mu_all:
             if args.ccdf:
-                plot_overlay_ccdf(
-                    tau_mu_all,
-                    title=r"Time-scale distribution $\tau_q$",
-                    outfile=os.path.join(args.outdir, "tau_ccdf_all.png"),
-                    args=args,
-                    n_seeds=n_seeds,
-                )
+                plot_overlay_ccdf(tau_mu_all, title=r"Time-scale distribution $\tau_q$",
+                                  outfile=os.path.join(args.outdir, f"{tag}tau_ccdf_all.png"),
+                                  args=args, n_seeds=n_seeds)
             else:
-                plot_overlay_pdf(
-                    tau_mu_all,
-                    title=r"Time-scale distribution $\tau_q$",
-                    outfile=os.path.join(args.outdir, "tau_pdf_all.png"),
-                    args=args,
-                    n_seeds=n_seeds,
-                )
-        else:
-            print("[info] no μ-fit τ distributions found.")
-    else:
+                plot_overlay_pdf(tau_mu_all, title=r"Time-scale distribution $\tau_q$",
+                                 outfile=os.path.join(args.outdir, f"{tag}tau_pdf_all.png"),
+                                 args=args, n_seeds=n_seeds)
+
+    # ── PER-SEED VIEW ──
+    if view in ("per_seed", "both") and not args.separate:
+        if tau_mu_per_seed:
+            if args.ccdf:
+                plot_overlay_ccdf_per_seed(tau_mu_per_seed,
+                                           title=r"Time-scale distribution $\tau_q$",
+                                           outfile=os.path.join(args.outdir, f"{ps_tag}tau_ccdf_all.png"),
+                                           args=args)
+            else:
+                plot_overlay_pdf_per_seed(tau_mu_per_seed,
+                                          title=r"Time-scale distribution $\tau_q$",
+                                          outfile=os.path.join(args.outdir, f"{ps_tag}tau_pdf_all.png"),
+                                          args=args)
+
+    # ── SEPARATE MODE (per-model figures, unchanged) ──
+    if args.separate:
         if not tau_gate_all and not tau_mu_all:
             print("[warn] no τ distributions found to plot.")
             return
-
         for m, tau in tau_gate_all.items():
-            plot_single_model_pdf(
-                tau,
-                title=f"Time-scale distribution — {m}",
-                outfile=os.path.join(args.outdir, f"tau_pdf_gate_{m}.png"),
-                args=args,
-            )
-
+            plot_single_model_pdf(tau, title=f"Time-scale distribution — {m}",
+                                  outfile=os.path.join(args.outdir, f"tau_pdf_gate_{m}.png"),
+                                  args=args)
         for m, tau in tau_mu_all.items():
-            plot_single_model_pdf(
-                tau,
-                title=rf"Time-scale distribution $\tau_q$ — {m}",
-                outfile=os.path.join(args.outdir, f"tau_pdf_{m}.png"),
-                args=args,
-            )
+            plot_single_model_pdf(tau, title=rf"Time-scale distribution $\tau_q$ — {m}",
+                                  outfile=os.path.join(args.outdir, f"tau_pdf_{m}.png"),
+                                  args=args)
 
     print("\nDone.")
 

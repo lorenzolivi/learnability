@@ -18,24 +18,25 @@ The key idea:
 DIRECTORY CONVENTION
 ================================================================================
 
-  results/T1024/baselines/adamw_lagmax256/
-    seed_212/
-      const/const_summary.csv
-      shared/shared_summary.csv
-      diag/diag_summary.csv
-      H_N_summary.csv
-      ...
-    seed_1001/
-      ...
-
-  results/T1024/lstm_gru/adamw_lagmax256/
-    seed_212/
-      gru/gru_summary.csv
-      lstm/lstm_summary.csv
-      H_N_summary.csv
-      ...
-    seed_1001/
-      ...
+  results/T1024/<optimizer>/
+    baselines/
+      seed_1/
+        const/const_summary.csv
+        shared/shared_summary.csv
+        diag/diag_summary.csv
+        H_N_summary.csv
+        ...
+      seed_2/
+        ...
+    lstm_gru/
+      seed_1/
+        gru/gru_summary.csv
+        lstm/lstm_summary.csv
+        H_N_summary.csv
+        ...
+      seed_2/
+        ...
+    together/              ← all plots land here
 
 Note: DGX scripts may output in nested (model-subdir) layout.
 All plotting scripts support both flat and nested layouts automatically.
@@ -51,8 +52,8 @@ All plotting scripts support both flat and nested layouts automatically.
 
   python launch_multiseed.py \
     --seeds 212,1001,2002,3003,4004 \
-    --outdir_baselines results/T1024/baselines/adamw_lagmax256 \
-    --outdir_lstm_gru results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir_baselines results/T1024/adamw_lagmax256/baselines \
+    --outdir_lstm_gru results/T1024/adamw_lagmax256/lstm_gru \
     --common_args "--Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
       --optimizer adamw --momentum 0.9 --epochs 750 --batch_size 512 --lr 0.001 \
       --weight_decay 0.0001 --grad_clip 1.0 \
@@ -77,12 +78,12 @@ All plotting scripts support both flat and nested layouts automatically.
   tail -f logs/launch_multiseed.log
 
 
---- Same run with ECF alpha estimation ---
+--- Same run with McCulloch alpha estimation (legacy) ---
 
   python launch_multiseed.py \
     --seeds 212,1001,2002,3003,4004 \
-    --outdir_baselines results/T1024/baselines/adamw_lagmax256 \
-    --outdir_lstm_gru results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir_baselines results/T1024/adamw_lagmax256/baselines \
+    --outdir_lstm_gru results/T1024/adamw_lagmax256/lstm_gru \
     --common_args "--Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
       --optimizer adamw --momentum 0.9 --epochs 750 --batch_size 512 --lr 0.001 \
       --weight_decay 0.0001 --grad_clip 1.0 \
@@ -96,7 +97,7 @@ All plotting scripts support both flat and nested layouts automatically.
     --baseline_extra "--models const,shared,diag --const_s 0.05" \
     --lstm_gru_extra "--models lstm,gru" \
     --w_seed 212 \
-    --alpha_method ecf \
+    --alpha_method mcculloch \
     --min_samples_alpha 500 \
     --logdir logs \
     2>&1 | tee logs/launch_multiseed.log
@@ -106,8 +107,8 @@ All plotting scripts support both flat and nested layouts automatically.
 
   python launch_multiseed.py \
     --seeds 212,1001,2002,3003,4004 \
-    --outdir_baselines results/T1024/baselines/adamw_lagmax256 \
-    --outdir_lstm_gru results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir_baselines results/T1024/adamw_lagmax256/baselines \
+    --outdir_lstm_gru results/T1024/adamw_lagmax256/lstm_gru \
     --common_args "--Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
       --optimizer adamw --momentum 0.9 --epochs 750 --batch_size 512 --lr 0.001 \
       --weight_decay 0.0001 --grad_clip 1.0 \
@@ -129,8 +130,8 @@ All plotting scripts support both flat and nested layouts automatically.
 
   python launch_multiseed.py \
     --seeds 212,1001,2002,3003,4004 \
-    --outdir_baselines results/T1024/baselines/adamw_lagmax256 \
-    --outdir_lstm_gru results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir_baselines results/T1024/adamw_lagmax256/baselines \
+    --outdir_lstm_gru results/T1024/adamw_lagmax256/lstm_gru \
     --common_args "..." \
     --skip_baselines
 
@@ -155,8 +156,8 @@ All plotting scripts support both flat and nested layouts automatically.
   python launch_multiseed.py \
     --seeds 212,1001,2002,3003,4004 \
     --data_seed 42 \
-    --outdir_baselines results/T1024/baselines/adamw_lagmax256 \
-    --outdir_lstm_gru results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir_baselines results/T1024/adamw_lagmax256/baselines \
+    --outdir_lstm_gru results/T1024/adamw_lagmax256/lstm_gru \
     --common_args "..." \
     --w_seed 212
 
@@ -165,7 +166,7 @@ All plotting scripts support both flat and nested layouts automatically.
 
   # Seed 212 — baselines
   python run_learnability_DGX.py \
-    --outdir results/T1024/baselines/adamw_lagmax256/seed_212 \
+    --outdir results/T1024/adamw_lagmax256/baselines/seed_212 \
     --models const,shared,diag --const_s 0.05 \
     --seed 212 --w_seed 212 \
     --alpha_method ecf --min_samples_alpha 500 \
@@ -180,7 +181,7 @@ All plotting scripts support both flat and nested layouts automatically.
 
   # Seed 212 — lstm/gru
   python run_learnability_lstm_gru_DGX.py \
-    --outdir results/T1024/lstm_gru/adamw_lagmax256/seed_212 \
+    --outdir results/T1024/adamw_lagmax256/lstm_gru/seed_212 \
     --models lstm,gru \
     --seed 212 --w_seed 212 \
     --alpha_method ecf --min_samples_alpha 500 \
@@ -200,31 +201,47 @@ All plotting scripts support both flat and nested layouts automatically.
 2. PLOTTING — ALL PLOTS AT ONCE
 ================================================================================
 
-  # Run all 10 plot steps in sequence:
+  # Run all 10 plot steps in sequence (recommended: --view both):
   python plot_all_multiseed.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both
 
   # List available plot names:
   python plot_all_multiseed.py --list
 
   # Dry run (just show commands):
   python plot_all_multiseed.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256 \
-    --dry_run
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both --dry_run
 
   # Only run specific plots:
   python plot_all_multiseed.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256 \
-    --only hn,envelope
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both --only hn,envelope
 
   # Skip specific plots:
   python plot_all_multiseed.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256 \
-    --skip learning_curves,tau
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both --skip learning_curves,tau
+
+
+--- View modes (--view) ---
+
+  All plotting scripts accept --view with three options:
+
+    --view both         (default) generates DUAL output files:
+                          agg_<name>.png  — aggregated mean ± std across seeds
+                          ps_<name>.png   — per-seed individual traces
+    --view aggregated   generates a single file (no prefix): <name>.png
+    --view per_seed     generates a single file (no prefix): <name>.png
+
+  The --view flag is passed through by plot_all_multiseed.py to every sub-script.
+  fit_master_proportionality.py only produces aggregated output (tagged agg_
+  when --view both) since the master fit is seed-averaged by nature.
 
 
 ================================================================================
@@ -235,31 +252,32 @@ This is the key plot that MERGES baselines + lstm/gru AND aggregates seeds.
 
   # Multi-seed, auto-merge baselines + lstm/gru (default: mean +/- 1std):
   python plot_empirical_learnability_win.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both
 
   # Percentile view (median + 25th-75th shaded band):
   python plot_empirical_learnability_win.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256 \
-    --hn_view percentile
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both --hn_view percentile
 
   # Custom percentile range (10th-90th):
   python plot_empirical_learnability_win.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256 \
-    --hn_view percentile --pct_lo 10 --pct_hi 90
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both --hn_view percentile --pct_lo 10 --pct_hi 90
 
   # Box plot (one box per model at each N):
   python plot_empirical_learnability_win.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256 \
-    --hn_view boxplot
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both --hn_view boxplot
 
   # Single-seed backward compatibility (works with old-style directories):
   python plot_empirical_learnability_win.py \
-    --inputdir results/T1024/together/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256
+    --inputdir results/T1024/adamw_lagmax256/together \
+    --outdir results/T1024/adamw_lagmax256/together
 
 
 ================================================================================
@@ -268,20 +286,20 @@ This is the key plot that MERGES baselines + lstm/gru AND aggregates seeds.
 
   # Multi-seed + merge:
   python plot_envelope.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256 \
-    --show_fits 1 --save_fits 1 --fit_tempered 1
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both --show_fits 1 --save_fits 1 --fit_tempered 1
 
   # Same as original but from single dir:
   python plot_envelope.py \
-    --inputdir results/T1024/baselines/adamw_lagmax256 \
-    --outdir results/T1024/baselines/adamw_lagmax256
+    --inputdir results/T1024/adamw_lagmax256/baselines \
+    --outdir results/T1024/adamw_lagmax256/baselines
 
   # All fit options from the original are preserved:
   python plot_envelope.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256 \
-    --grid_mode intersection --mask_mode per_model \
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both --grid_mode intersection --mask_mode per_model \
     --show_fits 1 --trim_frac 0.02 --floor_exclude_factor 10 \
     --fit_tempered 1 --save_fits 1
 
@@ -292,20 +310,21 @@ This is the key plot that MERGES baselines + lstm/gru AND aggregates seeds.
 
   # Multi-seed (pools tau values across seeds):
   python plot_tau.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256/figures
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together/figures \
+    --view both
 
   # With CCDF on log-log:
   python plot_tau.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256/figures \
-    --ccdf --logx --logy --print_counts
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together/figures \
+    --view both --ccdf --logx --logy --print_counts
 
   # Per-model separate figures:
   python plot_tau.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256/figures \
-    --separate
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together/figures \
+    --view both --separate
 
 
 ================================================================================
@@ -313,8 +332,9 @@ This is the key plot that MERGES baselines + lstm/gru AND aggregates seeds.
 ================================================================================
 
   python plot_N_vs_envelope.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both
 
 
 ================================================================================
@@ -323,20 +343,21 @@ This is the key plot that MERGES baselines + lstm/gru AND aggregates seeds.
 
   # Default (KDE, reliable estimates only):
   python plot_alpha_estimation.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both
 
   # With histogram + KDE:
   python plot_alpha_estimation.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256 \
-    --both
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both --both
 
   # Show unreliable estimates (gray dashed) for comparison:
   python plot_alpha_estimation.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256 \
-    --both --show_unreliable
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both --both --show_unreliable
 
 
 ================================================================================
@@ -344,9 +365,9 @@ This is the key plot that MERGES baselines + lstm/gru AND aggregates seeds.
 ================================================================================
 
   python plot_noise_floor.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256/figures \
-    --N_budgets 500,8000
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together/figures \
+    --view both --N_budgets 500,8000
 
 
 ================================================================================
@@ -355,14 +376,15 @@ This is the key plot that MERGES baselines + lstm/gru AND aggregates seeds.
 
   # Note: uses --inputdirs (replaces the original --indir)
   python plot_learnability_learning_curves.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256/plots_learning_curves
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together/plots_learning_curves \
+    --view both
 
   # With log-scale loss:
   python plot_learnability_learning_curves.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256/plots_learning_curves \
-    --ylog 1
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together/plots_learning_curves \
+    --view both --ylog 1
 
 
 ================================================================================
@@ -370,23 +392,98 @@ This is the key plot that MERGES baselines + lstm/gru AND aggregates seeds.
 ================================================================================
 
   python fit_master_proportionality.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both
 
 
 ================================================================================
 11. PLOTTING — APPENDIX OPTIMIZER FIGURES
 ================================================================================
 
-  # For SGD:
+  # For SGD+momentum:
   python make_appendix_optimizer_figs.py \
-    --inputdirs results/T1024/baselines/sgd results/T1024/lstm_gru/sgd \
+    --inputdirs results/T1024/sgd_lagmax256/baselines results/T1024/sgd_lagmax256/lstm_gru \
     --outdir figs/appendix
 
-  # For momentum:
-  python make_appendix_optimizer_figs.py \
-    --inputdirs results/T1024/baselines/momentum results/T1024/lstm_gru/momentum \
-    --outdir figs/appendix
+
+================================================================================
+RMSprop EXPERIMENT (isolating adaptive 1/sqrt(v) scaling)
+================================================================================
+
+RMSprop isolates the second-moment adaptive scaling (1/sqrt(v)) without Adam's
+first-moment (momentum estimate) or bias correction. This tests whether the
+per-parameter 1/sqrt(v) rescaling alone is responsible for:
+  - the power-law envelope shoulders (beta > 0) seen under AdamW
+  - the architectural differentiation (different beta/tau per model)
+  - task learning (R² > 0)
+
+RMSprop update:
+  v_i(t) = alpha * v_i(t-1) + (1-alpha) * g_i(t)^2
+  theta_i(t+1) = theta_i(t) - lr / (sqrt(v_i(t)) + eps) * g_i(t)
+
+CLI: --optimizer rmsprop  (also supports --rmsprop_alpha, default 0.99)
+
+  python launch_multiseed.py \
+    --seeds 212,1001,2002,3003,4004 \
+    --outdir_baselines results/T1024/rmsprop_lagmax256/baselines \
+    --outdir_lstm_gru results/T1024/rmsprop_lagmax256/lstm_gru \
+    --common_args "--Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
+      --optimizer rmsprop --momentum 0.9 --rmsprop_alpha 0.99 \
+      --epochs 750 --batch_size 512 --lr 0.001 \
+      --weight_decay 0.0001 --grad_clip 1.0 \
+      --lag_min 4 --lag_max 256 --num_lags 128 \
+      --task_lags 32,64,128,192,256 --task_coeffs 0.6,0.5,0.4,0.32,0.26 \
+      --noise_std 0.3 \
+      --N_grid 25,50,100,150,200,300,400,600,800,1200,1600,2400,3200,4800,6400,9600,12800 \
+      --eps 0.1 --orth_init --layernorm \
+      --include_first_order_diag 1 --log_gate_stats 1 --gate_log_every 10 \
+      --device cuda" \
+    --baseline_extra "--models const,shared,diag --const_s 0.05" \
+    --lstm_gru_extra "--models lstm,gru" \
+    --w_seed 212 \
+    --logdir logs \
+    2>&1 | tee logs/launch_rmsprop.log
+
+--- Pure RMSprop (no momentum) — cleanest isolation of 1/sqrt(v) ---
+
+  python launch_multiseed.py \
+    --seeds 212,1001,2002,3003,4004 \
+    --outdir_baselines results/T1024/rmsprop_nomom_lagmax256/baselines \
+    --outdir_lstm_gru results/T1024/rmsprop_nomom_lagmax256/lstm_gru \
+    --common_args "--Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
+      --optimizer rmsprop --momentum 0 --rmsprop_alpha 0.99 \
+      --epochs 750 --batch_size 512 --lr 0.001 \
+      --weight_decay 0.0001 --grad_clip 1.0 \
+      --lag_min 4 --lag_max 256 --num_lags 128 \
+      --task_lags 32,64,128,192,256 --task_coeffs 0.6,0.5,0.4,0.32,0.26 \
+      --noise_std 0.3 \
+      --N_grid 25,50,100,150,200,300,400,600,800,1200,1600,2400,3200,4800,6400,9600,12800 \
+      --eps 0.1 --orth_init --layernorm \
+      --include_first_order_diag 1 --log_gate_stats 1 --gate_log_every 10 \
+      --device cuda" \
+    --baseline_extra "--models const,shared,diag --const_s 0.05" \
+    --lstm_gru_extra "--models lstm,gru" \
+    --w_seed 212 \
+    --logdir logs \
+    2>&1 | tee logs/launch_rmsprop_nomom.log
+
+  With --momentum 0, the update is purely:
+    theta(t+1) = theta(t) - lr / (sqrt(v(t)) + eps) * g(t)
+  No momentum buffer at all. This is the cleanest isolation of the adaptive
+  1/sqrt(v) per-parameter scaling effect, removing any confound from momentum
+  smoothing the raw gradient before or after preconditioning.
+
+Predictions:
+  If RMSprop produces power-law shoulders + task learning → 1/sqrt(v) is the
+    key mechanism; Adam's momentum and bias correction are secondary.
+  If RMSprop behaves like SGD+momentum → the full Adam mechanism (first-moment
+    + second-moment + bias correction) is needed, which would be surprising.
+  Intermediate behavior → partial confirmation; the 1/sqrt(v) helps but Adam's
+    momentum provides additional gradient smoothing that reveals weak long-lag
+    signals.
+  Comparing RMSprop+momentum vs pure RMSprop (--momentum 0) further isolates
+  whether momentum interacts with the adaptive scaling or is irrelevant.
 
 
 ================================================================================
@@ -398,8 +495,8 @@ TYPICAL FULL WORKFLOW (5 seeds, AdamW, T=1024, paper params)
 
   python launch_multiseed.py \
     --seeds 212,1001,2002,3003,4004 \
-    --outdir_baselines results/T1024/baselines/adamw_lagmax256 \
-    --outdir_lstm_gru results/T1024/lstm_gru/adamw_lagmax256 \
+    --outdir_baselines results/T1024/adamw_lagmax256/baselines \
+    --outdir_lstm_gru results/T1024/adamw_lagmax256/lstm_gru \
     --common_args "--Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
       --optimizer adamw --momentum 0.9 --epochs 750 --batch_size 512 --lr 0.001 \
       --weight_decay 0.0001 --grad_clip 1.0 \
@@ -421,8 +518,9 @@ TYPICAL FULL WORKFLOW (5 seeds, AdamW, T=1024, paper params)
 
   # Step 2: Plot everything (locally, after rsync from DGX)
   python plot_all_multiseed.py \
-    --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-    --outdir results/T1024/together/adamw_lagmax256
+    --inputdirs results/T1024/adamw_lagmax256/baselines results/T1024/adamw_lagmax256/lstm_gru \
+    --outdir results/T1024/adamw_lagmax256/together \
+    --view both
 
 
 ================================================================================
@@ -431,18 +529,18 @@ ALPHA ESTIMATION METHODS
 
 Two methods are available for estimating the stable tail index alpha-hat:
 
-  --alpha_method mcculloch   (default, backward compatible)
-    McCulloch (1986) quantile ratio method.
-    Uses 4 empirical quantiles (5th, 25th, 75th, 95th percentiles).
-    Fast but less efficient — throws away most of the sample information.
-    Can be unstable near alpha=2 (Gaussian limit).
-
-  --alpha_method ecf
+  --alpha_method ecf   (default)
     Koutrouvelis (1980) Empirical Characteristic Function regression.
     Uses the full sample via the empirical characteristic function.
     For symmetric stable (beta=0): log(-log|phi-hat(t)|^2) = log(2*sigma^alpha) + alpha*log|t|
     More robust across the full alpha in [1,2] range.
     Slightly slower (O(n*K) where K=50 grid points), but subsampled for large n.
+
+  --alpha_method mcculloch
+    McCulloch (1986) quantile ratio method.
+    Uses 4 empirical quantiles (5th, 25th, 75th, 95th percentiles).
+    Fast but less efficient — throws away most of the sample information.
+    Can be unstable near alpha=2 (Gaussian limit).
 
 Both methods output reliability flags in the summary CSV:
   - alpha_reliable: 1 if the estimate passes quality checks, 0 otherwise
@@ -469,8 +567,8 @@ All scripts work with old-style (single-seed, no seed_* subdirs) results too.
   # If your results dir has NO seed_* subdirs, the script treats the
   # directory itself as a single seed:
   python plot_envelope.py \
-    --inputdir results/T1024/baselines/adamw_lagmax256 \
-    --outdir results/T1024/baselines/adamw_lagmax256
+    --inputdir results/T1024/adamw_lagmax256/baselines \
+    --outdir results/T1024/adamw_lagmax256/baselines
 
   # This produces exactly the same output as the original plot_envelope.py.
 
@@ -488,6 +586,8 @@ NOTES
   This isolates the effect of training randomness (init + data).
 - 3-5 seeds are recommended. More is better but adds GPU time.
 - Plots show mean +/- 1 std as shaded bands. For single-seed, plain lines.
+- Use --view both to generate dual outputs (agg_ + ps_ prefixed files).
+  Use --view aggregated or --view per_seed for a single unprefixed output.
 - All scripts auto-detect which models are present; no need to specify.
 - The --data_seed option requires a small patch to the DGX scripts
   (see data_seed section above for instructions). Without it, --seed controls

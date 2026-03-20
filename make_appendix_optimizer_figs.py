@@ -463,16 +463,21 @@ def plot_tau_histogram(tau_by_arch: dict, title: str, outpath: str):
 # ── Architecture detection ────────────────────────────────────────────
 
 def detect_archs_in_seed_dirs(seed_dirs: list[str], arch_map: dict, require_mu_units: bool = True):
-    """Detect archs that have required files in ANY seed dir."""
+    """Detect archs that have required files in ANY seed dir.
+    Supports both flat and nested (model-subdir) layouts via find_file_in_seed_dir.
+    """
     found = set()
     for a in arch_map.keys():
         for sd in seed_dirs:
-            summ = os.path.join(sd, f"{a}_summary.csv")
-            mu_u = os.path.join(sd, f"{a}_mu_units.csv")
-            ok = os.path.exists(summ) and (os.path.exists(mu_u) if require_mu_units else True)
-            if ok:
-                found.add(a)
-                break
+            summ = seed_utils.find_file_in_seed_dir(sd, f"{a}_summary.csv", a)
+            if summ is None:
+                continue
+            if require_mu_units:
+                mu_u = seed_utils.find_file_in_seed_dir(sd, f"{a}_mu_units.csv", a)
+                if mu_u is None:
+                    continue
+            found.add(a)
+            break
     return sorted([a for a in arch_map.keys() if a in found])
 
 # ── Main ───────────────────────────────────────────────────────────────
@@ -524,12 +529,12 @@ def main():
     for a in archs:
         label = arch_map[a]
 
-        # Load summaries across seeds
+        # Load summaries across seeds (supports flat and nested layouts)
         ell_sets_a = []
         summary_dfs = []
         for sd in seed_dirs:
-            summ_path = os.path.join(sd, f"{a}_summary.csv")
-            if not os.path.exists(summ_path):
+            summ_path = seed_utils.find_file_in_seed_dir(sd, f"{a}_summary.csv", a)
+            if summ_path is None:
                 continue
             try:
                 ell_s, mu_mean = read_summary(summ_path)
@@ -571,11 +576,11 @@ def main():
         summary_agg[label] = (grid_a, mu_mean_agg, mu_std_agg)
         ell_sets.append(set(grid_a.tolist()))
 
-        # Load mu_units across seeds
+        # Load mu_units across seeds (supports flat and nested layouts)
         units_list = []
         for sd in seed_dirs:
-            mu_u_path = os.path.join(sd, f"{a}_mu_units.csv")
-            if not os.path.exists(mu_u_path):
+            mu_u_path = seed_utils.find_file_in_seed_dir(sd, f"{a}_mu_units.csv", a)
+            if mu_u_path is None:
                 continue
             try:
                 ell_u, units = read_mu_units(mu_u_path)

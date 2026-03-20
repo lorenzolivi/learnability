@@ -206,7 +206,7 @@ def color_for(label: str):
 # Plotting
 # ───────────────────────────────────────────────────────────────
 
-def plot_overlay_loss(model_data_agg, outdir, dpi, ylog):
+def plot_overlay_loss(model_data_agg, outdir, dpi, ylog, tag=""):
     """All models, train (solid) + val (dashed) loss with ±1std band if multi-seed."""
     fig, ax = plt.subplots(figsize=(7.8, 4.8))
     any_data = False
@@ -256,11 +256,11 @@ def plot_overlay_loss(model_data_agg, outdir, dpi, ylog):
     ax.grid(True, alpha=0.25)
     ax.legend(fontsize=7, ncol=2)
     fig.tight_layout()
-    fig.savefig(os.path.join(outdir, "learning_curves_loss.png"), dpi=dpi, bbox_inches="tight")
+    fig.savefig(os.path.join(outdir, f"{tag}learning_curves_loss.png"), dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_overlay_r2(model_data_agg, outdir, dpi):
+def plot_overlay_r2(model_data_agg, outdir, dpi, tag=""):
     """All models, train (solid) + val (dashed) R² with ±1std band if multi-seed."""
     fig, ax = plt.subplots(figsize=(7.8, 4.8))
     any_data = False
@@ -310,7 +310,7 @@ def plot_overlay_r2(model_data_agg, outdir, dpi):
     ax.grid(True, alpha=0.25)
     ax.legend(fontsize=7, ncol=2)
     fig.tight_layout()
-    fig.savefig(os.path.join(outdir, "learning_curves_r2.png"), dpi=dpi, bbox_inches="tight")
+    fig.savefig(os.path.join(outdir, f"{tag}learning_curves_r2.png"), dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -396,9 +396,85 @@ def plot_per_model(model_data_agg, outdir, dpi, ylog):
 # Main
 # ───────────────────────────────────────────────────────────────
 
+def plot_overlay_loss_per_seed(model_data_raw, outdir, dpi, ylog, tag=""):
+    """Per-seed loss traces overlaid."""
+    fig, ax = plt.subplots(figsize=(7.8, 4.8))
+    legend_handles = {}
+
+    for model_name in sorted(model_data_raw.keys()):
+        entries = model_data_raw[model_name]
+        color = seed_utils.get_model_color(model_name)
+
+        for i, entry in enumerate(entries):
+            lc = read_lc(entry["csv"])
+            if lc is None:
+                continue
+            alpha = seed_utils.SEED_ALPHAS[i] if i < len(seed_utils.SEED_ALPHAS) else 0.3
+            # Train loss
+            line, = ax.plot(lc["epoch"], lc["train_loss"], "-", color=color,
+                            alpha=alpha, linewidth=0.8)
+            if model_name not in legend_handles:
+                legend_handles[model_name] = line
+            # Val loss (dashed)
+            ax.plot(lc["epoch"], lc["val_loss"], "--", color=color,
+                    alpha=alpha * 0.7, linewidth=0.6)
+
+    if not legend_handles:
+        plt.close(fig)
+        return
+
+    if ylog:
+        ax.set_yscale("log")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("MSE loss")
+    ax.set_title("Learning curves — loss [per seed]")
+    ax.grid(True, alpha=0.25)
+    ax.legend(legend_handles.values(), legend_handles.keys(), fontsize=7)
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, f"{tag}learning_curves_loss.png"), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_overlay_r2_per_seed(model_data_raw, outdir, dpi, tag=""):
+    """Per-seed R² traces overlaid."""
+    fig, ax = plt.subplots(figsize=(7.8, 4.8))
+    legend_handles = {}
+
+    for model_name in sorted(model_data_raw.keys()):
+        entries = model_data_raw[model_name]
+        color = seed_utils.get_model_color(model_name)
+
+        for i, entry in enumerate(entries):
+            lc = read_lc(entry["csv"])
+            if lc is None or lc["train_acc"] is None:
+                continue
+            alpha = seed_utils.SEED_ALPHAS[i] if i < len(seed_utils.SEED_ALPHAS) else 0.3
+            line, = ax.plot(lc["epoch"], lc["train_acc"], "-", color=color,
+                            alpha=alpha, linewidth=0.8)
+            if model_name not in legend_handles:
+                legend_handles[model_name] = line
+            if lc["val_acc"] is not None:
+                ax.plot(lc["epoch"], lc["val_acc"], "--", color=color,
+                        alpha=alpha * 0.7, linewidth=0.6)
+
+    if not legend_handles:
+        plt.close(fig)
+        return
+
+    ax.set_xlabel("epoch")
+    ax.set_ylabel(r"R$^2$")
+    ax.set_title(r"Learning curves — R$^2$ [per seed]")
+    ax.grid(True, alpha=0.25)
+    ax.legend(legend_handles.values(), legend_handles.keys(), fontsize=7)
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, f"{tag}learning_curves_r2.png"), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Plot multi-seed learnability learning curves.")
     seed_utils.add_multiseed_args(ap)
+    seed_utils.add_view_arg(ap)
     ap.add_argument(
         "--outdir",
         type=str,
@@ -417,6 +493,7 @@ def main():
         help="If 1, use log-scale on loss y-axis"
     )
     args = ap.parse_args()
+    view = args.view
 
     # Resolve input directories
     inputdirs = seed_utils.resolve_inputdirs(args)
@@ -426,10 +503,10 @@ def main():
         raise ValueError("No seed directories found (or inputdir not specified)")
 
     seed_utils.print_seed_info(seed_dirs, inputdirs)
+    print(f"[info] view mode: {view}")
 
     # Set output directory
     if args.outdir is None:
-        # Use first inputdir as base
         args.outdir = os.path.join(inputdirs[0], "plots_learning_curves")
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -443,8 +520,6 @@ def main():
     for model_name in sorted(model_data.keys()):
         entries = model_data[model_name]
         print(f"  {model_name:12s}  ({len(entries)} seed(s))")
-        for e in entries:
-            print(f"    - {e['csv']}")
 
     # Aggregate each model across seeds
     model_data_agg = {}
@@ -456,10 +531,18 @@ def main():
     if not model_data_agg:
         raise RuntimeError("No valid learning curve data after aggregation")
 
-    # Plot
-    plot_overlay_loss(model_data_agg, args.outdir, args.dpi, ylog=bool(args.ylog))
-    plot_overlay_r2(model_data_agg, args.outdir, args.dpi)
-    plot_per_model(model_data_agg, args.outdir, args.dpi, ylog=bool(args.ylog))
+    # ── AGGREGATED VIEW ──
+    if view in ("aggregated", "both"):
+        agg_tag = "agg_" if view == "both" else ""
+        plot_overlay_loss(model_data_agg, args.outdir, args.dpi, ylog=bool(args.ylog), tag=agg_tag)
+        plot_overlay_r2(model_data_agg, args.outdir, args.dpi, tag=agg_tag)
+        plot_per_model(model_data_agg, args.outdir, args.dpi, ylog=bool(args.ylog))
+
+    # ── PER-SEED VIEW ──
+    if view in ("per_seed", "both"):
+        ps_tag = "ps_" if view == "both" else ""
+        plot_overlay_loss_per_seed(model_data, args.outdir, args.dpi, ylog=bool(args.ylog), tag=ps_tag)
+        plot_overlay_r2_per_seed(model_data, args.outdir, args.dpi, tag=ps_tag)
 
     print(f"[OK] Saved learning-curve plots to: {args.outdir}")
 

@@ -20,17 +20,45 @@ from typing import Optional
 # ── Canonical model names ──────────────────────────────────────────────
 CANDIDATE_MODELS = ["const", "shared", "diag", "gru", "lstm"]
 
-MODEL_COLS_HN = {
-    "const": "H_N_const",
-    "shared": "H_N_shared",
-    "diag": "H_N_diag",
-    "gru": "H_N_gru",
-    "lstm": "H_N_lstm",
+# ── H_N column mappings by alpha method ────────────────────────────────
+MODEL_COLS_HN_ECF = {
+    "const": "H_N_const_ecf",
+    "shared": "H_N_shared_ecf",
+    "diag": "H_N_diag_ecf",
+    "gru": "H_N_gru_ecf",
+    "lstm": "H_N_lstm_ecf",
 }
+
+MODEL_COLS_HN_MCC = {
+    "const": "H_N_const_mcc",
+    "shared": "H_N_shared_mcc",
+    "diag": "H_N_diag_mcc",
+    "gru": "H_N_gru_mcc",
+    "lstm": "H_N_lstm_mcc",
+}
+
+# Keep old dict for backward compat (defaults to ECF)
+MODEL_COLS_HN = MODEL_COLS_HN_ECF
 
 CANDIDATE_SUMMARY_FILES = {
     m: f"{m}_summary.csv" for m in CANDIDATE_MODELS
 }
+
+
+# ── H_N column helper ──────────────────────────────────────────────────
+
+def get_model_hn_col(model: str, method: str = "ecf") -> str:
+    """
+    Return the H_N column name for a given model and alpha method.
+
+    Args:
+        model: model name (e.g., "const", "diag", "lstm")
+        method: alpha method, "ecf" or "mcc" (default: "ecf")
+
+    Returns:
+        column name like "H_N_const_ecf" or "H_N_diag_mcc"
+    """
+    return f"H_N_{model}_{method}"
 
 
 # ── Seed directory discovery ───────────────────────────────────────────
@@ -430,6 +458,89 @@ def shade_between(ax, x, y_mean, y_std, color=None, alpha=0.2, **kwargs):
     c = color or line[0].get_color()
     ax.fill_between(x, y_mean - y_std, y_mean + y_std, alpha=alpha, color=c)
     return line
+
+
+def shade_minmax(ax, x, y_min, y_max, color=None, alpha=0.15, **kwargs):
+    """Plot min-max shaded band (no mean line) with median."""
+    x = np.asarray(x, dtype=float)
+    y_min = np.asarray(y_min, dtype=float)
+    y_max = np.asarray(y_max, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y_min) & np.isfinite(y_max)
+    x, y_min, y_max = x[mask], y_min[mask], y_max[mask]
+
+    line = ax.plot(x, 0.5 * (y_min + y_max), linewidth=1.0, **kwargs)
+    c = color or line[0].get_color()
+    ax.fill_between(x, y_min, y_max, alpha=alpha, color=c)
+    return line
+
+
+# ── Per-seed data loading (no aggregation) ────────────────────────────
+
+def load_model_data_per_seed(
+    seed_dirs: list[str],
+    model: str,
+    required_cols: Optional[set] = None,
+) -> list[tuple[str, pd.DataFrame]]:
+    """
+    Load <model>_summary.csv from each seed WITHOUT aggregating.
+
+    Returns: list of (seed_label, DataFrame) pairs.
+    """
+    result = []
+    for sd in seed_dirs:
+        path = find_file_in_seed_dir(sd, f"{model}_summary.csv", model)
+        if path is None:
+            continue
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            continue
+        if required_cols is not None:
+            missing = required_cols - set(df.columns)
+            if missing:
+                continue
+        label = os.path.basename(sd)
+        result.append((label, df))
+    return result
+
+
+def get_seed_label(seed_dir: str) -> str:
+    """Extract seed label (e.g., 'seed_1') from a seed directory path."""
+    return os.path.basename(seed_dir)
+
+
+# ── View mode CLI helpers ─────────────────────────────────────────────
+
+def add_view_arg(parser):
+    """Add --view argument: per_seed, aggregated, or both."""
+    parser.add_argument(
+        "--view",
+        type=str,
+        default="both",
+        choices=["per_seed", "aggregated", "both"],
+        help="Output mode: per_seed (individual seed traces), aggregated "
+             "(spread summary), or both (default: both).",
+    )
+    return parser
+
+
+# ── Standard model colors ─────────────────────────────────────────────
+
+MODEL_COLORS = {
+    "const": "#1f77b4",   # blue
+    "shared": "#ff7f0e",  # orange
+    "diag": "#2ca02c",    # green
+    "gru": "#d62728",     # red
+    "lstm": "#9467bd",    # purple
+}
+
+SEED_ALPHAS = [1.0, 0.7, 0.5, 0.4, 0.3]  # visual weight: seed 1 darkest
+
+
+def get_model_color(model: str) -> str:
+    """Return the canonical color for a model."""
+    return MODEL_COLORS.get(model, "#333333")
 
 
 def print_seed_info(seed_dirs: list[str], inputdirs: list[str]):

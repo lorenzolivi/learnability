@@ -53,6 +53,12 @@ PLOT_STEPS = [
         "extra_args": ["--show_fits", "1", "--save_fits", "1", "--fit_tempered", "1"],
     },
     {
+        "name": "envelope_decomp",
+        "label": "Envelope decomposition (f_gates vs f_adapt)",
+        "script": "plot_envelope_decomposition.py",
+        "extra_args": [],
+    },
+    {
         "name": "tau",
         "label": "Tau distributions (CCDF)",
         "script": "plot_tau.py",
@@ -137,6 +143,13 @@ def parse_args():
         action="store_true",
         help="Print commands without running them",
     )
+    p.add_argument(
+        "--view",
+        type=str,
+        default="both",
+        choices=["per_seed", "aggregated", "both"],
+        help="Output mode passed to all sub-scripts: per_seed, aggregated, or both (default: both).",
+    )
     return p.parse_args()
 
 
@@ -195,6 +208,7 @@ def main():
             python_exe, script,
             "--inputdirs", *args.inputdirs,
             "--outdir", outdir,
+            "--view", args.view,
             *step["extra_args"],
         ]
         cmd_str = " ".join(cmd_parts)

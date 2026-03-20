@@ -94,11 +94,11 @@ def parse_args():
         "--alpha_method",
         type=str,
         default=None,
-        choices=["mcculloch", "ecf"],
+        choices=["ecf", "mcculloch"],
         help=(
             "Method for estimating the stable tail index α̂. "
             "Passed through to DGX scripts via --alpha_method. "
-            "If not set, the DGX scripts use their default (mcculloch)."
+            "If not set, the DGX scripts use their default (ecf)."
         ),
     )
     p.add_argument(
