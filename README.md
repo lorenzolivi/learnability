@@ -221,4 +221,4 @@ the `alpha_reliable` column in summary CSVs. The plotting script
 
 ## License
 
-This code is released for academic and research use. See the paper for details.
+This project is released under the MIT License. See [LICENSE](/Users/lorenzo/university/research/projects/dynamical_theory_learning/learnability/LICENSE).
