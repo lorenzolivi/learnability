@@ -25,6 +25,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seed_utils
 
+# Subfolder for organizing output (relative to outdir)
+SUBFOLDER = "learnability_window"
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -233,8 +235,12 @@ def main():
     if not os.path.isdir(outdir):
         os.makedirs(outdir, exist_ok=True)
 
+    # Create subfolder for this script's outputs
+    plot_outdir = os.path.join(outdir, SUBFOLDER)
+    os.makedirs(plot_outdir, exist_ok=True)
+
     seed_utils.print_seed_info(seed_dirs, inputdirs)
-    print(f"[info] saving figure to: {os.path.abspath(outdir)}")
+    print(f"[info] saving figure to: {os.path.abspath(plot_outdir)}")
     print(f"[info] H_N view: {args.hn_view}, view mode: {view}")
 
     # Load H_N_summary.csv from each seed
@@ -339,7 +345,7 @@ def main():
             fig.tight_layout()
 
             suffix = {"mean_std": "", "percentile": "_percentile", "boxplot": "_boxplot"}
-            outpath = os.path.join(outdir, f"{tag}H_N_curves{suffix[args.hn_view]}{method_tag}.png")
+            outpath = os.path.join(plot_outdir, f"{tag}H_N_curves{suffix[args.hn_view]}{method_tag}.png")
             fig.savefig(outpath, dpi=300)
             plt.close(fig)
             print(f"[ok] saved: {outpath}")
@@ -360,7 +366,7 @@ def main():
             fig.tight_layout()
 
             suffix = {"mean_std": "", "percentile": "_percentile", "boxplot": "_boxplot"}
-            outpath = os.path.join(outdir, f"{tag}H_N_curves{suffix[args.hn_view]}{method_tag}.png")
+            outpath = os.path.join(plot_outdir, f"{tag}H_N_curves{suffix[args.hn_view]}{method_tag}.png")
             fig.savefig(outpath, dpi=300)
             plt.close(fig)
             print(f"[ok] saved: {outpath}")

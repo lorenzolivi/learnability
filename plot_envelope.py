@@ -58,6 +58,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seed_utils
 
+# Subfolder for organizing output (relative to outdir)
+SUBFOLDER = "envelope"
+
 
 # ------------------------------------------------------------
 # CLI
@@ -566,8 +569,12 @@ def main():
     if not os.path.isdir(outdir):
         os.makedirs(outdir, exist_ok=True)
 
+    # Create subfolder for this script's outputs
+    plot_outdir = os.path.join(outdir, SUBFOLDER)
+    os.makedirs(plot_outdir, exist_ok=True)
+
     seed_utils.print_seed_info(seed_dirs, inputdirs)
-    print(f"[info] saving figures to: {os.path.abspath(outdir)}")
+    print(f"[info] saving figures to: {os.path.abspath(plot_outdir)}")
     print(f"[info] view mode: {view}")
 
     # ── Load aggregated data (for aggregated view and fits) ──────────
@@ -769,7 +776,7 @@ def main():
             print(s)
 
         if int(args.save_fits) == 1:
-            fits_path = os.path.join(outdir, args.fits_filename)
+            fits_path = os.path.join(plot_outdir, args.fits_filename)
             with open(fits_path, "w") as fjson:
                 json.dump(fits_out, fjson, indent=2)
             print(f"[ok] saved fits: {fits_path}")
@@ -784,7 +791,7 @@ def main():
             xlabel=r"lag $\ell$",
             ylabel=r"$\hat{f}(\ell)$",
             title=r"Envelope scaling $\hat{f}(\ell)$ [aggregated]",
-            outpath=os.path.join(outdir, f"{tag}envelope_mu_vs_ell.png"),
+            outpath=os.path.join(plot_outdir, f"{tag}envelope_mu_vs_ell.png"),
             show_fits=False,
         )
 
@@ -796,7 +803,7 @@ def main():
             xlabel=r"lag $\ell$",
             ylabel=r"$\log \hat{f}(\ell)$",
             title=r"Envelope scaling $\log \hat{f}(\ell)$ [aggregated]",
-            outpath=os.path.join(outdir, f"{tag}log_envelope_vs_ell.png"),
+            outpath=os.path.join(plot_outdir, f"{tag}log_envelope_vs_ell.png"),
             fit_overlays=exp_fits if show_fits else None,
             fit_x_mode="linear",
             show_fits=show_fits,
@@ -810,7 +817,7 @@ def main():
             xlabel=r"$\log \ell$",
             ylabel=r"$\log \hat{f}(\ell)$",
             title=r"Envelope scaling $\log \hat{f}(\ell)$ vs $\log \ell$ [aggregated]",
-            outpath=os.path.join(outdir, f"{tag}log_envelope_vs_log_ell.png"),
+            outpath=os.path.join(plot_outdir, f"{tag}log_envelope_vs_log_ell.png"),
             fit_overlays=pow_fits if show_fits else None,
             fit_x_mode="log",
             show_fits=show_fits,
@@ -826,7 +833,7 @@ def main():
             xlabel=r"lag $\ell$",
             ylabel=r"$\hat{f}(\ell)$",
             title=r"Envelope scaling $\hat{f}(\ell)$ [per seed]",
-            outpath=os.path.join(outdir, f"{tag}envelope_mu_vs_ell.png"),
+            outpath=os.path.join(plot_outdir, f"{tag}envelope_mu_vs_ell.png"),
             show_fits=False,
         )
 
@@ -842,7 +849,7 @@ def main():
             xlabel=r"lag $\ell$",
             ylabel=r"$\log \hat{f}(\ell)$",
             title=r"Envelope scaling $\log \hat{f}(\ell)$ [per seed]",
-            outpath=os.path.join(outdir, f"{tag}log_envelope_vs_ell.png"),
+            outpath=os.path.join(plot_outdir, f"{tag}log_envelope_vs_ell.png"),
             transform=_semilog_transform,
             fit_overlays=exp_fits if show_fits else None,
             fit_x_mode="linear",
@@ -862,7 +869,7 @@ def main():
             xlabel=r"$\log \ell$",
             ylabel=r"$\log \hat{f}(\ell)$",
             title=r"Envelope scaling $\log \hat{f}(\ell)$ vs $\log \ell$ [per seed]",
-            outpath=os.path.join(outdir, f"{tag}log_envelope_vs_log_ell.png"),
+            outpath=os.path.join(plot_outdir, f"{tag}log_envelope_vs_log_ell.png"),
             transform=_loglog_transform,
             fit_overlays=pow_fits if show_fits else None,
             fit_x_mode="log",

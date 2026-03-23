@@ -23,6 +23,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seed_utils
 
+# Subfolder for organizing output (relative to outdir)
+SUBFOLDER = "learning_curves"
 
 # ───────────────────────────────────────────────────────────────
 # Recursive discovery
@@ -510,6 +512,10 @@ def main():
         args.outdir = os.path.join(inputdirs[0], "plots_learning_curves")
     os.makedirs(args.outdir, exist_ok=True)
 
+    # Create subfolder for this script's outputs
+    plot_outdir = os.path.join(args.outdir, SUBFOLDER)
+    os.makedirs(plot_outdir, exist_ok=True)
+
     # Find learning curve CSVs
     model_data = find_learning_curve_csvs(seed_dirs)
 
@@ -534,17 +540,17 @@ def main():
     # ── AGGREGATED VIEW ──
     if view in ("aggregated", "both"):
         agg_tag = "agg_" if view == "both" else ""
-        plot_overlay_loss(model_data_agg, args.outdir, args.dpi, ylog=bool(args.ylog), tag=agg_tag)
-        plot_overlay_r2(model_data_agg, args.outdir, args.dpi, tag=agg_tag)
-        plot_per_model(model_data_agg, args.outdir, args.dpi, ylog=bool(args.ylog))
+        plot_overlay_loss(model_data_agg, plot_outdir, args.dpi, ylog=bool(args.ylog), tag=agg_tag)
+        plot_overlay_r2(model_data_agg, plot_outdir, args.dpi, tag=agg_tag)
+        plot_per_model(model_data_agg, plot_outdir, args.dpi, ylog=bool(args.ylog))
 
     # ── PER-SEED VIEW ──
     if view in ("per_seed", "both"):
         ps_tag = "ps_" if view == "both" else ""
-        plot_overlay_loss_per_seed(model_data, args.outdir, args.dpi, ylog=bool(args.ylog), tag=ps_tag)
-        plot_overlay_r2_per_seed(model_data, args.outdir, args.dpi, tag=ps_tag)
+        plot_overlay_loss_per_seed(model_data, plot_outdir, args.dpi, ylog=bool(args.ylog), tag=ps_tag)
+        plot_overlay_r2_per_seed(model_data, plot_outdir, args.dpi, tag=ps_tag)
 
-    print(f"[OK] Saved learning-curve plots to: {args.outdir}")
+    print(f"[OK] Saved learning-curve plots to: {plot_outdir}")
 
 
 if __name__ == "__main__":

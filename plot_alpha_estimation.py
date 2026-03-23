@@ -26,6 +26,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seed_utils
 
+# Subfolder for organizing output (relative to outdir)
+SUBFOLDER = "alpha_estimation"
 
 # ── Helper functions for dual-alpha format ──
 def _alpha_col(method):
@@ -34,6 +36,8 @@ def _alpha_col(method):
 
 def _sigma_col(method):
     """Return column name for sigma_alpha given method."""
+    if method == "hat":
+        return "sigma_alpha_hat"  # old single-method format
     return f"sigma_{method}"
 
 def _reliable_col(method):
@@ -148,11 +152,143 @@ def kde_1d(x: np.ndarray, grid: np.ndarray) -> np.ndarray:
     return dens
 
 
+def plot_alpha_agreement_diagnostic(seed_dirs, plot_outdir):
+    """
+    Generate an agreement diagnostic figure for dual-alpha methods (ECF vs McCulloch).
+
+    Looks for columns: alpha_ecf, alpha_mcc, alpha_mcc_ci_lo, alpha_mcc_ci_hi, alpha_methods_agree
+    If these exist, plots:
+    - Panel 1: Scatter α̂_ECF vs α̂_McCulloch with y=x line, colored by agreement
+    - Panel 2: Histogram of |α̂_ECF − α̂_McCulloch|
+    - Panel 3: Bar chart of agreement rate per architecture
+
+    If dual columns don't exist, gracefully skip with a print message.
+    """
+    # Try to load data and check if dual-alpha columns exist
+    sample_df = None
+    for model in seed_utils.CANDIDATE_MODELS:
+        per_seed_traces = seed_utils.load_model_data_per_seed(seed_dirs, model)
+        if per_seed_traces:
+            sample_df = per_seed_traces[0][1]
+            break
+
+    if sample_df is None:
+        return
+
+    required_cols = {"alpha_ecf", "alpha_mcc", "alpha_mcc_ci_lo",
+                     "alpha_mcc_ci_hi", "alpha_methods_agree"}
+    if not all(col in sample_df.columns for col in required_cols):
+        print("[info] Dual-alpha diagnostic columns not found; skipping alpha_agreement_diagnostic.png")
+        return
+
+    print("[info] Generating alpha_agreement_diagnostic.png...")
+
+    # Pool data across all models and seeds
+    all_ecf = []
+    all_mcc = []
+    all_agree = []
+    agree_per_model = {}
+
+    for model in seed_utils.CANDIDATE_MODELS:
+        per_seed_traces = seed_utils.load_model_data_per_seed(seed_dirs, model)
+        if not per_seed_traces:
+            continue
+
+        model_agree_count = 0
+        model_total_count = 0
+
+        for seed_label, df in per_seed_traces:
+            # Filter for finite alpha values
+            mask = (np.isfinite(df["alpha_ecf"].values) &
+                    np.isfinite(df["alpha_mcc"].values))
+
+            if mask.sum() == 0:
+                continue
+
+            ecf = df.loc[mask, "alpha_ecf"].values
+            mcc = df.loc[mask, "alpha_mcc"].values
+            agree = df.loc[mask, "alpha_methods_agree"].values.astype(bool)
+
+            all_ecf.extend(ecf)
+            all_mcc.extend(mcc)
+            all_agree.extend(agree)
+
+            model_agree_count += agree.sum()
+            model_total_count += len(agree)
+
+        if model_total_count > 0:
+            agree_per_model[model] = model_agree_count / model_total_count
+
+    if len(all_ecf) == 0:
+        print("[warn] No dual-alpha data found; skipping diagnostic")
+        return
+
+    all_ecf = np.array(all_ecf)
+    all_mcc = np.array(all_mcc)
+    all_agree = np.array(all_agree)
+
+    # Create figure with 3 panels
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+
+    # Panel 1: Scatter plot with y=x line
+    ax = axes[0]
+    agree_mask = all_agree == 1
+    ax.scatter(all_ecf[agree_mask], all_mcc[agree_mask], alpha=0.5, s=20,
+               color="green", label="Agree")
+    ax.scatter(all_ecf[~agree_mask], all_mcc[~agree_mask], alpha=0.5, s=20,
+               color="red", label="Disagree")
+
+    # y=x reference line
+    alpha_range = [min(all_ecf.min(), all_mcc.min()), max(all_ecf.max(), all_mcc.max())]
+    ax.plot(alpha_range, alpha_range, "k--", linewidth=1, alpha=0.4)
+
+    ax.set_xlabel(r"$\hat{\alpha}_{\mathrm{ECF}}$")
+    ax.set_ylabel(r"$\hat{\alpha}_{\mathrm{McCulloch}}$")
+    ax.set_title(r"$\hat{\alpha}_{\mathrm{ECF}}$ vs $\hat{\alpha}_{\mathrm{McCulloch}}$")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Panel 2: Histogram of absolute difference
+    ax = axes[1]
+    diff = np.abs(all_ecf - all_mcc)
+    ax.hist(diff, bins=30, edgecolor="black", alpha=0.7)
+    ax.set_xlabel(r"$|\hat{\alpha}_{\mathrm{ECF}} - \hat{\alpha}_{\mathrm{McCulloch}}|$")
+    ax.set_ylabel("Count")
+    ax.set_title(f"Absolute difference (median={np.median(diff):.3f})")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    # Panel 3: Agreement rate per architecture
+    ax = axes[2]
+    if agree_per_model:
+        models = list(agree_per_model.keys())
+        rates = [agree_per_model[m] * 100 for m in models]
+        bars = ax.bar(models, rates, color=[seed_utils.get_model_color(m) for m in models], alpha=0.7, edgecolor="black")
+        ax.set_ylabel("Agreement rate (%)")
+        ax.set_title("Agreement rate by architecture")
+        ax.set_ylim([0, 105])
+        ax.grid(True, alpha=0.3, axis="y")
+        # Add percentage labels on bars
+        for bar, rate in zip(bars, rates):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{rate:.1f}%', ha='center', va='bottom', fontsize=9)
+
+    fig.tight_layout()
+    outpath = os.path.join(plot_outdir, "alpha_agreement_diagnostic.png")
+    fig.savefig(outpath, dpi=300)
+    plt.close(fig)
+    print(f"[ok] saved: {outpath}")
+
+
 def main():
     args = parse_args()
     view = args.view
     outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
+
+    # Create subfolder for this script's outputs
+    plot_outdir = os.path.join(outdir, SUBFOLDER)
+    os.makedirs(plot_outdir, exist_ok=True)
 
     # Resolve input directories
     inputdirs = seed_utils.resolve_inputdirs(args)
@@ -280,7 +416,7 @@ def main():
             plt.title(rf"Distributions of $\hat\alpha(\ell)$ [aggregated, {method}]")
             plt.legend(fontsize=8)
             plt.tight_layout()
-            outpath = os.path.join(outdir, f"{tag}alpha_hat_distributions{method_tag}.png")
+            outpath = os.path.join(plot_outdir, f"{tag}alpha_hat_distributions{method_tag}.png")
             plt.savefig(outpath, dpi=300)
             plt.close()
             print(f"[ok] saved: {outpath}")
@@ -309,10 +445,13 @@ def main():
             if legend_handles:
                 plt.legend(legend_handles.values(), legend_handles.keys(), fontsize=8)
             plt.tight_layout()
-            outpath = os.path.join(outdir, f"{tag}alpha_hat_distributions{method_tag}.png")
+            outpath = os.path.join(plot_outdir, f"{tag}alpha_hat_distributions{method_tag}.png")
             plt.savefig(outpath, dpi=300)
             plt.close()
             print(f"[ok] saved: {outpath}")
+
+    # Generate alpha agreement diagnostic (if dual-alpha methods are available)
+    plot_alpha_agreement_diagnostic(seed_dirs, plot_outdir)
 
 
 if __name__ == "__main__":

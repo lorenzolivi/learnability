@@ -31,6 +31,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seed_utils
 
+# Subfolder for organizing output (relative to outdir)
+SUBFOLDER = "sample_complexity"
+
 CANON_MODELS = ["const", "shared", "diag", "gru", "lstm"]
 
 
@@ -41,6 +44,8 @@ def _alpha_col(method):
 
 def _nreq_col(method):
     """Return column name for N_required given method."""
+    if method == "hat":
+        return "N_required_at_eps"  # old single-method format
     return f"N_required_{method}"
 JSON_MODELS = {
     "const": "ConstGate",
@@ -202,7 +207,7 @@ def load_and_aggregate_summaries(seed_dirs, model, f_col, N_col, method: str = "
         )
 
     if not dfs:
-        return None, []
+        return None, [], None, None
 
     # Store per-seed data before aggregation (for individual point plotting)
     seed_dfs_subset = []
@@ -238,18 +243,22 @@ def load_and_aggregate_summaries(seed_dirs, model, f_col, N_col, method: str = "
         "ell": agg_data["ell"],
         "f_hat_mean": agg_data[f"{f_col}_mean"],
         "f_hat_std": agg_data[f"{f_col}_std"],
-        "alpha_hat_mean": agg_data["alpha_hat_mean"],
-        "alpha_hat_std": agg_data["alpha_hat_std"],
-        "N_req_mean": agg_data[f"{N_col}_mean"],
-        "N_req_std": agg_data[f"{N_col}_std"],
+        "alpha_hat_mean": agg_data[f"{alpha_col_to_use}_mean"],
+        "alpha_hat_std": agg_data[f"{alpha_col_to_use}_std"],
+        "N_req_mean": agg_data[f"{nreq_col_to_use}_mean"],
+        "N_req_std": agg_data[f"{nreq_col_to_use}_std"],
     })
 
-    return result, seed_dfs_subset
+    return result, seed_dfs_subset, alpha_col_to_use, nreq_col_to_use
 
 def main():
     args = parse_args()
     view = args.view
     os.makedirs(args.outdir, exist_ok=True)
+
+    # Create subfolder for this script's outputs
+    plot_outdir = os.path.join(args.outdir, SUBFOLDER)
+    os.makedirs(plot_outdir, exist_ok=True)
 
     # Resolve input directories
     inputdirs = seed_utils.resolve_inputdirs(args)
@@ -275,21 +284,21 @@ def main():
     # With --view both, we tag with "agg_" for consistency with other scripts.
     tag = "agg_" if view == "both" else ""
 
-    # Detect which alpha methods are available
-    alpha_methods = ["ecf", "mcc"]  # Try both; fall back to old format if needed
-    sample_data = None
+    # Detect which alpha methods are available by inspecting a sample CSV
+    alpha_methods = ["hat"]  # default to old format
+    sample_df = None
     for m in models:
-        agg_data, _ = load_and_aggregate_summaries(seed_dirs, m, args.f_col, args.N_col, method="ecf")
-        if agg_data is not None:
-            sample_data = agg_data
+        per_seed = seed_utils.load_model_data_per_seed(seed_dirs, m)
+        if per_seed:
+            sample_df = per_seed[0][1]
             break
-
-    if sample_data is not None:
-        if "f_hat_mean" in sample_data.columns:
-            # Check what's available
-            if "alpha_hat_mean" in sample_data.columns and "alpha_ecf_mean" not in sample_data.columns:
-                alpha_methods = ["hat"]  # Old format
-            # else assume both ecf and mcc exist, or will handle gracefully
+    if sample_df is not None:
+        if "alpha_ecf" in sample_df.columns:
+            alpha_methods = ["ecf", "mcc"]
+        elif "alpha_mcc" in sample_df.columns:
+            alpha_methods = ["mcc"]
+        elif "alpha_hat" in sample_df.columns:
+            alpha_methods = ["hat"]
 
     print(f"[info] detected alpha methods: {alpha_methods}")
 
@@ -308,7 +317,7 @@ def main():
             ell_min, ell_max, beta, beta_r2 = win
 
             # Load and aggregate summaries across seeds
-            agg_data, seed_dfs = load_and_aggregate_summaries(
+            agg_data, seed_dfs, alpha_col_used, nreq_col_used = load_and_aggregate_summaries(
                 seed_dirs, m, args.f_col, args.N_col, method=method
             )
 
@@ -353,7 +362,7 @@ def main():
             a, b, r2, yhat = linfit(d["x"].values, d["y"].values)
             d["y_hat"] = yhat
 
-            pts_path = os.path.join(args.outdir, f"{tag}fit_master_points_{m}{method_tag}.csv")
+            pts_path = os.path.join(plot_outdir, f"{tag}fit_master_points_{m}{method_tag}.csv")
             d.to_csv(pts_path, index=False)
 
             # Plot
@@ -405,7 +414,7 @@ def main():
             )
             plt.tight_layout()
 
-            fig_path = os.path.join(args.outdir, f"{tag}fit_master_{m}{method_tag}.png")
+            fig_path = os.path.join(plot_outdir, f"{tag}fit_master_{m}{method_tag}.png")
             plt.savefig(fig_path, dpi=300)
             plt.close()
 
@@ -422,7 +431,8 @@ def main():
                 "intercept_a": float(a),
                 "r2": float(r2),
                 "f_col_used": args.f_col,
-                "N_col_used": args.N_col,
+                "alpha_col_used": alpha_col_used,
+                "N_col_used": nreq_col_used,
                 "n_seeds": len(seed_dirs),
             })
 
@@ -436,7 +446,7 @@ def main():
 
         if summary_rows:
             summ = pd.DataFrame(summary_rows)
-            summ_path = os.path.join(args.outdir, f"{tag}fit_master_summary{method_tag}.csv")
+            summ_path = os.path.join(plot_outdir, f"{tag}fit_master_summary{method_tag}.csv")
             summ.to_csv(summ_path, index=False)
             if args.verbose:
                 print(f"\n[info] ({method}) wrote summary: {summ_path}")

@@ -20,6 +20,7 @@ No small positive points are removed from the log plots (only nonpositive are Na
 Optionally overlays fitted trends on log-plots:
   - semi-log:  log f(ell) = a - lambda * ell
   - log-log:   log f(ell) = c - beta * log ell
+  - tempered:  log f(ell) = log A - beta*log ell - (ell/ell_c)^k
 Fits are performed on the *unclamped* positive values, inside a reduced window
 (default: keep middle 80% of usable points, and exclude f < floor_exclude_factor*eps).
 
@@ -32,7 +33,7 @@ Optionally also saves a combined 1x2 panel for backward compatibility:
   - <optimizer>_envelope_scaling.png
 
 Optionally saves fit parameters:
-  - <optimizer>_envelope_fits.json
+  - <optimizer>_envelope_fits.json  (includes R^2, SSR, AIC/BIC, tempered fits)
 
 Usage:
   python make_appendix_optimizer_figs.py --inputdirs momentum --outdir figs/appendix
@@ -46,6 +47,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seed_utils
+
+# Subfolder for organizing output (relative to outdir)
+SUBFOLDER = "optimizer_comparison"
 
 # ── CLI ────────────────────────────────────────────────────────────────
 
@@ -132,6 +136,37 @@ def parse_args():
         choices=[0, 1],
         help="If 1, save fit parameters JSON (default: 1)."
     )
+    p.add_argument(
+        "--fit_tempered",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="If 1, also fit a tempered power-law / truncated power-law regime (default: 1).",
+    )
+    p.add_argument(
+        "--k_grid",
+        type=str,
+        default="0.25,0.35,0.5,0.7,1.0,1.3,1.6",
+        help="Comma-separated k values for tempered cutoff grid search.",
+    )
+    p.add_argument(
+        "--ellc_grid_size",
+        type=int,
+        default=40,
+        help="Number of ell_c values (log-spaced) for tempered fit grid search.",
+    )
+    p.add_argument(
+        "--ellc_grid_min_factor",
+        type=float,
+        default=0.5,
+        help="Lower bound for ell_c grid: factor * ell_min_fit.",
+    )
+    p.add_argument(
+        "--ellc_grid_max_factor",
+        type=float,
+        default=2.0,
+        help="Upper bound for ell_c grid: factor * ell_max_fit.",
+    )
 
     return p.parse_args()
 
@@ -217,19 +252,32 @@ def extract_on_grid(ell: np.ndarray, y: np.ndarray, grid: np.ndarray) -> np.ndar
 
 # ── Fit utilities ──────────────────────────────────────────────────────
 
-def _linear_fit_r2(x: np.ndarray, y: np.ndarray):
+def _linear_fit_with_stats(x: np.ndarray, y: np.ndarray):
     """
-    Fit y = a + b x, return (a, b, r2). Requires len(x)>=2.
+    Fit y = a + b x, return dict with: a, b, yhat, ssr, r2.
     """
     x = np.asarray(x, dtype=float).reshape(-1)
     y = np.asarray(y, dtype=float).reshape(-1)
     A = np.vstack([np.ones_like(x), x]).T
     a, b = np.linalg.lstsq(A, y, rcond=None)[0]
     yhat = a + b * x
-    ssr = np.sum((y - yhat) ** 2)
-    sst = np.sum((y - np.mean(y)) ** 2)
-    r2 = 1 - ssr / sst if sst > 0 else np.nan
-    return float(a), float(b), float(r2)
+    ssr = float(np.sum((y - yhat) ** 2))
+    sst = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = float(1 - ssr / sst) if sst > 0 else np.nan
+    return {"a": float(a), "b": float(b), "yhat": yhat, "ssr": ssr, "r2": r2}
+
+
+def _aic_bic_from_ssr(ssr: float, n: int, p: int, tiny: float = 1e-300):
+    """Gaussian LS information criteria (up to additive constants)."""
+    n = int(n)
+    p = int(p)
+    if n <= 0 or p <= 0 or not np.isfinite(ssr):
+        return {"aic": np.nan, "bic": np.nan, "p": p}
+    ssr_eff = max(float(ssr), float(tiny))
+    val = n * np.log(ssr_eff / n)
+    aic = float(val + 2.0 * p)
+    bic = float(val + p * np.log(n))
+    return {"aic": aic, "bic": bic, "p": p}
 
 def _select_fit_window(
     ells: np.ndarray,
@@ -277,13 +325,16 @@ def fit_exponential_lambda(
         return None
     x = ells[idx]
     y = np.log(f_pos[idx])
-    a, b, r2 = _linear_fit_r2(x, y)
-    lam = -b
+    st = _linear_fit_with_stats(x, y)
+    lam = -st["b"]
+    ic = _aic_bic_from_ssr(st["ssr"], n=int(x.size), p=2)
     return {
-        "a": a,
-        "b": b,
+        "a": st["a"],
+        "b": st["b"],
         "lambda": float(lam),
-        "r2": float(r2),
+        "r2": float(st["r2"]),
+        "ssr": float(st["ssr"]),
+        **ic,
         "ell_min": float(np.min(x)),
         "ell_max": float(np.max(x)),
         "n": int(x.size),
@@ -305,16 +356,98 @@ def fit_powerlaw_beta(
         return None
     x = np.log(ells[idx])
     y = np.log(f_pos[idx])
-    a, b, r2 = _linear_fit_r2(x, y)
-    beta = -b
+    st = _linear_fit_with_stats(x, y)
+    beta = -st["b"]
+    ic = _aic_bic_from_ssr(st["ssr"], n=int(idx.size), p=2)
     return {
-        "a": a,
-        "b": b,
+        "a": st["a"],
+        "b": st["b"],
         "beta": float(beta),
-        "r2": float(r2),
+        "r2": float(st["r2"]),
+        "ssr": float(st["ssr"]),
+        **ic,
         "ell_min": float(np.min(ells[idx])),
         "ell_max": float(np.max(ells[idx])),
         "n": int(idx.size),
+    }
+
+
+def fit_tempered_powerlaw(
+    ells: np.ndarray,
+    f_pos: np.ndarray,
+    eps: float,
+    trim_frac: float,
+    floor_exclude_factor: float,
+    min_fit_points: int,
+    k_grid: list[float],
+    ellc_grid_size: int,
+    ellc_grid_min_factor: float,
+    ellc_grid_max_factor: float,
+):
+    """Fit tempered / truncated power law: f(ell) = A * ell^{-beta} * exp(-(ell/ell_c)^k)."""
+    idx = _select_fit_window(ells, f_pos, eps, trim_frac, floor_exclude_factor, min_fit_points)
+    if idx.size == 0:
+        return None
+
+    ell = np.asarray(ells[idx], dtype=float)
+    y = np.log(np.asarray(f_pos[idx], dtype=float))
+    logell = np.log(ell)
+
+    ell_min = float(np.min(ell))
+    ell_max = float(np.max(ell))
+
+    lo = max(1e-12, float(ellc_grid_min_factor) * ell_min)
+    hi = max(lo * 1.001, float(ellc_grid_max_factor) * ell_max)
+    ellc_grid = np.logspace(np.log10(lo), np.log10(hi), int(max(5, ellc_grid_size)))
+
+    best = None
+    best_ssr = np.inf
+    ones = np.ones_like(logell)
+
+    for k in k_grid:
+        k = float(k)
+        if not np.isfinite(k) or k <= 0:
+            continue
+        for ell_c in ellc_grid:
+            ell_c = float(ell_c)
+            t = (ell / ell_c) ** k
+            X = np.vstack([ones, logell, t]).T
+            coeffs, *_ = np.linalg.lstsq(X, y, rcond=None)
+            c, b1, b2 = [float(v) for v in coeffs]
+            yhat = X @ coeffs
+            ssr = float(np.sum((y - yhat) ** 2))
+            if ssr < best_ssr:
+                best_ssr = ssr
+                best = (c, b1, b2, ell_c, k, yhat)
+
+    if best is None:
+        return None
+
+    c, b1, b2, ell_c, k, yhat = best
+    sst = float(np.sum((y - float(np.mean(y))) ** 2))
+    r2 = float(1.0 - best_ssr / sst) if sst > 0 else np.nan
+
+    logA = float(c)
+    A = float(np.exp(logA))
+    beta = float(-b1)
+    cutoff_coeff = float(-b2)
+
+    n = int(len(ell))
+    ic = _aic_bic_from_ssr(best_ssr, n=n, p=5)
+
+    return {
+        "logA": float(logA),
+        "A": float(A),
+        "beta": float(beta),
+        "ell_c": float(ell_c),
+        "k": float(k),
+        "cutoff_coeff": float(cutoff_coeff),
+        "r2": float(r2),
+        "ssr": float(best_ssr),
+        **ic,
+        "ell_min": float(ell_min),
+        "ell_max": float(ell_max),
+        "n": int(n),
     }
 
 def plot_curves(
@@ -495,13 +628,17 @@ def main():
     outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
 
+    # Create subfolder for this script's outputs
+    plot_outdir = os.path.join(outdir, SUBFOLDER)
+    os.makedirs(plot_outdir, exist_ok=True)
+
     optimizer_tag = os.path.basename(os.path.abspath(inputdirs[0]))
 
     print(f"[info] discovered {len(seed_dirs)} seed/data dir(s)")
     for sd in seed_dirs:
         print(f"  - {os.path.abspath(sd)}")
     print(f"[info] optimizer_tag: {optimizer_tag}")
-    print(f"[info] outdir: {os.path.abspath(outdir)}")
+    print(f"[info] outdir: {os.path.abspath(plot_outdir)}")
 
     # LOWERCASE LABELS ONLY (for legends/JSON consistency)
     arch_map = {
@@ -648,8 +785,11 @@ def main():
 
     # Fits (on unclamped positive data)
     show_fits = bool(int(args.show_fits) == 1)
+    do_tempered = bool(int(args.fit_tempered) == 1)
+    k_grid = [float(v) for v in str(args.k_grid).split(",") if str(v).strip()]
     exp_fits = {}
     pow_fits = {}
+    tempered_fits = {}
     fits_out = {
         "meta": {
             "optimizer": optimizer_tag,
@@ -661,6 +801,15 @@ def main():
             "floor_scale": float(args.floor_scale),
             "min_floor": float(args.min_floor),
             "n_seeds": len(seed_dirs),
+            "fit_tempered": int(args.fit_tempered),
+            "criteria": {
+                "R2": "1 - SSR/SST",
+                "AIC": "n*log(SSR/n) + 2p",
+                "BIC": "n*log(SSR/n) + p*log(n)",
+                "p_exp": 2,
+                "p_power": 2,
+                "p_tempered": 5,
+            },
         },
         "models": {},
     }
@@ -684,26 +833,47 @@ def main():
                 floor_exclude_factor=float(args.floor_exclude_factor),
                 min_fit_points=int(args.min_fit_points),
             )
+            ft = None
+            if do_tempered:
+                ft = fit_tempered_powerlaw(
+                    grid_ells,
+                    y,
+                    eps=e,
+                    trim_frac=float(args.trim_frac),
+                    floor_exclude_factor=float(args.floor_exclude_factor),
+                    min_fit_points=int(args.min_fit_points),
+                    k_grid=k_grid,
+                    ellc_grid_size=int(args.ellc_grid_size),
+                    ellc_grid_min_factor=float(args.ellc_grid_min_factor),
+                    ellc_grid_max_factor=float(args.ellc_grid_max_factor),
+                )
             exp_fits[label] = fe
             pow_fits[label] = fp
-            fits_out["models"][label] = {"eps": e, "exp": fe, "power": fp}
+            tempered_fits[label] = ft
+            fits_out["models"][label] = {"eps": e, "exp": fe, "power": fp, "tempered": ft}
 
-        print("[info] fit summary (exp: lambda, power: beta):")
+        print("[info] fit summary (exp / power / tempered):")
         for label in mu_mean_grid.keys():
-            fe, fp = exp_fits.get(label), pow_fits.get(label)
+            fe, fp, ft = exp_fits.get(label), pow_fits.get(label), tempered_fits.get(label)
             s = f"  - {label}: "
             if fe is not None:
-                s += f"lambda={fe['lambda']:.4g}, R2={fe['r2']:.4g} | "
+                s += f"exp: lambda={fe['lambda']:.4g}, R2={fe['r2']:.4g}, AIC={fe['aic']:.3g}, BIC={fe['bic']:.3g} | "
             else:
-                s += "lambda=NA | "
+                s += "exp: NA | "
             if fp is not None:
-                s += f"beta={fp['beta']:.4g}, R2={fp['r2']:.4g}"
+                s += f"power: beta={fp['beta']:.4g}, R2={fp['r2']:.4g}, AIC={fp['aic']:.3g}, BIC={fp['bic']:.3g}"
             else:
-                s += "beta=NA"
+                s += "power: NA"
+            if do_tempered:
+                if ft is not None:
+                    s += (f" | tempered: beta={ft['beta']:.4g}, ell_c={ft['ell_c']:.4g}, "
+                          f"k={ft['k']:.4g}, R2={ft['r2']:.4g}, AIC={ft['aic']:.3g}, BIC={ft['bic']:.3g}")
+                else:
+                    s += " | tempered: NA"
             print(s)
 
         if int(args.save_fits) == 1:
-            fits_path = os.path.join(outdir, f"{optimizer_tag}_envelope_fits.json")
+            fits_path = os.path.join(plot_outdir, f"{optimizer_tag}_envelope_fits.json")
             with open(fits_path, "w") as fjson:
                 json.dump(fits_out, fjson, indent=2)
             print(f"[ok] saved fits: {fits_path}")
@@ -715,7 +885,7 @@ def main():
         xlabel=r"lag $\ell$",
         ylabel=r"$\log \hat{f}(\ell)$",
         title=rf"Envelope scaling $\log \hat{{f}}(\ell)$ — {optimizer_tag.upper()}",
-        outpath=os.path.join(outdir, f"{optimizer_tag}_log_envelope_vs_ell.png"),
+        outpath=os.path.join(plot_outdir, f"{optimizer_tag}_log_envelope_vs_ell.png"),
         fit_overlays=exp_fits if show_fits else None,
         fit_x_mode="linear",
         show_fits=show_fits,
@@ -728,7 +898,7 @@ def main():
         xlabel=r"$\log \ell$",
         ylabel=r"$\log \hat{f}(\ell)$",
         title=rf"Envelope scaling $\log \hat{{f}}(\ell)$ vs $\log \ell$ — {optimizer_tag.upper()}",
-        outpath=os.path.join(outdir, f"{optimizer_tag}_log_envelope_vs_log_ell.png"),
+        outpath=os.path.join(plot_outdir, f"{optimizer_tag}_log_envelope_vs_log_ell.png"),
         fit_overlays=pow_fits if show_fits else None,
         fit_x_mode="log",
         show_fits=show_fits,
@@ -803,7 +973,7 @@ def main():
             axs[1].legend()
             fig.suptitle(f"Envelope scaling ({optimizer_tag.upper()})", fontsize=12)
             fig.tight_layout()
-            panel_path = os.path.join(outdir, f"{optimizer_tag}_envelope_scaling.png")
+            panel_path = os.path.join(plot_outdir, f"{optimizer_tag}_envelope_scaling.png")
             fig.savefig(panel_path, dpi=300, bbox_inches="tight")
             plt.close(fig)
             print(f"[ok] saved: {panel_path}")
@@ -830,7 +1000,7 @@ def main():
     plot_tau_histogram(
         tau_by_arch=tau_by_arch,
         title=rf"Time-scale distribution $\tau_q$ — {optimizer_tag.upper()}",
-        outpath=os.path.join(outdir, f"{optimizer_tag}_tau_spectra.png"),
+        outpath=os.path.join(plot_outdir, f"{optimizer_tag}_tau_spectra.png"),
     )
 
 if __name__ == "__main__":

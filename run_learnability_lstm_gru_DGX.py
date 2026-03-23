@@ -1,63 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Empirical learnability-window pipeline — LSTM and GRU
-
-Reference: "Learnability Window in Gated Recurrent Neural Networks"
-           (see the paper for theoretical background and notation).
-
-This script trains each model on a synthetic multi-lag regression task
-(y_t = Σ_k c_k u^T x_{t-ℓ_k} + noise), then runs the full learnability
-diagnostic pipeline from the paper:
-
-  1. Train model via streaming CPU→GPU batches.
-  2. For each diagnostic lag ℓ in a grid:
-     a. Compute the architecture-specific diagonal Jacobian factorisation.
-        GRU: leak = (1-z), rdiag captures z/r/candidate gate derivatives.
-        LSTM: forget gate f, expression e = o·(1-tanh²(c)), cdiag = ∂c_t/∂h_{t-1}.
-     b. Compute the JVP sensitivity v_t = (∂h_t/∂θ)[w] along a random
-        unit direction w (fixed across lags for comparability).
-     c. Form the matched statistic ψ_t(ℓ) = Σ_q μ^(q)_t(ℓ) δ_t^(q) v_{t-ℓ}^(q).
-     d. Estimate tail index α̂(ℓ) via McCulloch quantile method.
-     e. Compute empirical SNR and N_required(ℓ) at threshold ε.
-  3. Aggregate into learnability window H_N.
-  4. Fit exponential time-scale τ from per-unit envelope.
-
-GPU-memory safety:
-  - Datasets stay on CPU (pinned); batches streamed to GPU.
-  - Per-ℓ matched-statistic samples written to temporary memmap files on
-    disk (deleted as soon as quantiles are computed).
-
-Outputs (per model, in <outdir>/<model>/):
-  - <model>_learning_curve.csv       epoch-level train/val loss and R²
-  - <model>_summary.csv              per-lag: μ, α̂, σ̂, N_required, SNR
-  - <model>_mu_units.csv             per-lag × per-unit envelope values
-  - <model>_tau_from_mu_units.csv    per-unit exponential τ fits
-  - <model>_tau_from_mu_stats.json   summary statistics for τ distribution
-  - <model>_envelope_fits.json       exponential and power-law fits to μ(ℓ)
-  - <model>_H_N.csv                  learnability window vs training budget
-  - gate_stats_<model>.csv           periodic gate activation statistics
-
-Outputs (aggregate, in <outdir>/):
-  - H_N_summary.csv                  all models' H_N side-by-side
-  - cli_args.csv                     full CLI arguments for reproducibility
-
-Code organisation (top → bottom):
-  1. Small utilities (logger, seed, layernorm switch)
-  2. Streaming evaluation helper
-  3. JVP utilities (forward-mode AD for parameter sensitivity)
-  4. Prefix-sum helpers for ℓ-step window products/sums
-  5. McCulloch α-stable estimator
-  6. SNR and detection-error helpers
-  7. Synthetic data generation (same task as baselines script)
-  8. Architecture-specific prefix builders (GRU, LSTM)
-  9. Model definitions (GRUModel, LSTMModel)
- 10. Training loop (streaming CPU→GPU)
- 11. Fit utilities (exponential τ, envelope regimes, H_N)
- 12. Diagnostics pipeline (run_for_model)
- 13. CLI argument parser
- 14. main()
-"""
+"""Empirical learnability-window pipeline for GRU and LSTM models."""
 
 import argparse
 import csv
@@ -74,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.func import functional_call, jvp
+
+from seed_utils import bootstrap_mcculloch
 
 
 # ============================================================
@@ -98,14 +43,6 @@ def set_seed(seed: int) -> None:
 def layernorm_if(enabled: bool, dim: int) -> nn.Module:
     """Return a LayerNorm module if enabled, otherwise nn.Identity (no-op)."""
     return nn.LayerNorm(dim) if enabled else nn.Identity()
-
-def try_remove(path: str) -> None:
-    """Silently remove a file if it exists (used for tmp memmap cleanup)."""
-    try:
-        if path and os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
 
 def now_s() -> float:
     """Current wall-clock time in seconds (for timing diagnostics)."""
@@ -706,14 +643,26 @@ def compute_snr(alpha_hat: float, sigma_hat: float, mbar_Tmean: float, Nuse: int
     exp = 1.0 - 1.0 / alpha_eff
     return float(mbar_Tmean * (int(Nuse) ** exp) / float(sigma_hat))
 
-def detection_error_on_prefix(T_seq_memmap: np.memmap, Nuse: int) -> float:
-    """Coefficient of variation (std/|mean|) of the first Nuse matched-stat samples."""
-    Nuse = max(1, int(Nuse))
-    arr = np.asarray(T_seq_memmap[:Nuse], dtype=np.float64)
-    if arr.size == 0:
+def detection_error_on_prefix_arr(arr: np.ndarray, Nuse: int) -> float:
+    """
+    Coefficient of variation of the first Nuse per-sequence matched-statistic means.
+
+    This is the empirical detection error: std(ψ̄) / |mean(ψ̄)|.
+    A small value indicates the mean shift is large relative to noise.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        1-D array of per-sequence means ψ̄_n(ℓ).
+    Nuse : int
+        Number of samples (sequences) to use.
+    """
+    Nuse = max(1, min(int(Nuse), len(arr)))
+    subset = np.asarray(arr[:Nuse], dtype=np.float64)
+    if subset.size == 0:
         return float("nan")
-    mu = float(np.mean(arr))
-    sd = float(np.std(arr) + 1e-12)
+    mu = float(np.mean(subset))
+    sd = float(np.std(subset) + 1e-12)
     return float(sd / (abs(mu) + 1e-12))
 
 
@@ -1351,18 +1300,7 @@ def compute_H_N(ells: List[int], Nreq_by_ell: Dict[int, int], N_values: List[int
 
 
 # ============================================================
-# Diagnostics pipeline (streaming + memmap + cleanup)
-#
-# After training, this function runs the full learnability diagnostic
-# pipeline on the diagnostic dataset (Xdg, Ydg).  The logic mirrors
-# the baselines script but uses architecture-specific Jacobian terms:
-#
-#   GRU:  leak=(1-z), rdiag from z/r/candidate derivatives
-#   LSTM: forget gate f, expression e, cdiag from f/i/g derivatives
-#
-# The matched statistic ψ samples are written to disk-backed memmap
-# files (one per lag) and deleted as soon as quantiles are computed,
-# keeping disk usage bounded.
+# Diagnostics pipeline
 # ============================================================
 
 def run_for_model(args, model_name: str, mdir: str,
@@ -1370,19 +1308,7 @@ def run_for_model(args, model_name: str, mdir: str,
                   Xdg_cpu: torch.Tensor, Ydg_cpu: torch.Tensor,
                   device: torch.device,
                   u_vec: Optional[np.ndarray]) -> Dict:
-    """
-    Train one model and run the full learnability diagnostic pipeline.
-
-    Steps:
-      1. Build and train the model.
-      2. Stream diagnostic batches to extract Jacobian terms and JVP.
-      3. For each lag ℓ, compute envelope μ and matched-stat ψ (→ memmap).
-      4. Post-process: McCulloch α̂, σ̂, SNR, N_required per lag.
-      5. Fit per-unit exponential τ from |μ^(q)(ℓ)|.
-
-    Returns a dict with per-lag results: envelope values, tail indices,
-    N_required, alpha/sigma estimates.
-    """
+    """Train one model and run the learnability diagnostics."""
     model = build_model(model_name, args.D, args.H, ln=args.layernorm).to(device)
 
     log(f"[run:{model_name}] train start")
@@ -1435,17 +1361,15 @@ def run_for_model(args, model_name: str, mdir: str,
     Bdg, Tdg, _ = Xdg_cpu.shape
     Hdim = int(args.H)
 
-    memmap_paths: Dict[int, str] = {}
-    memmaps: Dict[int, np.memmap] = {}
-    write_offsets: Dict[int, int] = {}
-    expected_sizes: Dict[int, int] = {}
+    # Per-sequence matched-statistic means ψ̄_n(ℓ).
+    psi_seq_lists: Dict[int, list] = {ell: [] for ell in ells_list}
 
     sum_mass: Dict[int, float] = {ell: 0.0 for ell in ells_list}
     sum_log_mass: Dict[int, float] = {ell: 0.0 for ell in ells_list}
     count_seq: Dict[int, int] = {ell: 0 for ell in ells_list}
     sum_unit: Dict[int, np.ndarray] = {ell: np.zeros(Hdim, dtype=np.float64) for ell in ells_list}
 
-    # Envelope decomposition: f_gates(ell) = mu * sum_q |Gamma^(q)_{t,ell}|
+    # Envelope decomposition terms.
     sum_mass_gates: Dict[int, float] = {ell: 0.0 for ell in ells_list}
     sum_unit_gates: Dict[int, np.ndarray] = {ell: np.zeros(Hdim, dtype=np.float64) for ell in ells_list}
 
@@ -1454,32 +1378,10 @@ def run_for_model(args, model_name: str, mdir: str,
     sum_lambda_sq: Dict[int, float] = {ell: 0.0 for ell in ells_list}
     count_lambda: Dict[int, int] = {ell: 0 for ell in ells_list}
 
-    sum_psi: Dict[int, float] = {ell: 0.0 for ell in ells_list}
-    count_psi: Dict[int, int] = {ell: 0 for ell in ells_list}
-
-    total_tmp_bytes = 0
-    for ell in ells_list:
-        n_samples = int(Bdg * max(0, (Tdg - ell)))
-        expected_sizes[ell] = n_samples
-        tmp_path = os.path.join(mdir, f"{model_name}_Tseq_ell{ell:04d}.tmp")
-        memmap_paths[ell] = tmp_path
-        write_offsets[ell] = 0
-        memmaps[ell] = np.memmap(tmp_path, dtype=np.float64, mode="w+", shape=(n_samples,))
-        total_tmp_bytes += n_samples * 8
-
-    def cleanup_all_tmp():
-        for ell in ells_list:
-            try:
-                if ell in memmaps:
-                    memmaps[ell].flush()
-            except Exception:
-                pass
-            try_remove(memmap_paths.get(ell, ""))
-
     try:
         log(f"[run:{model_name}] diag stream start: Bdg={Bdg} T={Tdg} H={Hdim} num_lags={len(ells_list)}")
         log(f"[diag:{model_name}] orient_matched_statistic_sign={int(bool(args.orient_matched_statistic_sign))}")
-        log(f"[run:{model_name}] tmp memmaps created (~{total_tmp_bytes/1e9:.2f} GB on disk)")
+        log(f"[diag:{model_name}] per-sequence means: {Bdg} sequences per lag")
         t_diag0 = now_s()
 
         Bb = min(int(args.diag_batch_size), int(Bdg))
@@ -1547,26 +1449,16 @@ def run_for_model(args, model_name: str, mdir: str,
                         else:
                             mu = mu0
 
-                    # ---------------------------------------------------------
-                    # Envelope decomposition: accumulate f_gates(ell) = mu * |Gamma|
-                    # BEFORE applying the adaptive base rate Lambda^(q)_r.
-                    # mu here is the transport factor Gamma^(q)_{t,ell}.
-                    # ---------------------------------------------------------
                     if mu.numel() > 0:
                         abs_gamma = torch.abs(mu).double()
-                        gates_mass = (args.lr * abs_gamma.mean(dim=2).mean(dim=1)).sum().item()
+                        gates_mass = (args.lr * abs_gamma.sum(dim=2).mean(dim=1)).sum().item()
                         sum_mass_gates[ell] += float(gates_mass)
                         sum_unit_gates[ell] += (args.lr * abs_gamma.mean(dim=1).sum(dim=0)).detach().cpu().numpy()
 
-                    # ---------------------------------------------------------
-                    # Effective learning rate: mu^(q)_{t,ell} = Lambda^(q)_{r,ell} * Gamma^(q)_{t,ell}
-                    # Lag-dependent Rayleigh quotient (exact) or uniform fallback (SGD)
-                    # ---------------------------------------------------------
                     if use_lag_dependent and mu.numel() > 0:
                         Lambda_ell = compute_lag_dependent_rates(
                             lambda_matrix, hseq, mu.shape[1], Lambda_q_fallback)
                         mu = mu * Lambda_ell.to(mu.dtype)
-                        # Track per-lag Lambda statistics
                         lam_flat = Lambda_ell.detach().float()
                         lam_mean_val = lam_flat.mean().item()
                         lam_sq_val = (lam_flat ** 2).mean().item()
@@ -1581,7 +1473,7 @@ def run_for_model(args, model_name: str, mdir: str,
                 with torch.no_grad():
                     if mu.numel() > 0:
                         abs_mu = torch.abs(mu).double()
-                        mass_per_seq = abs_mu.mean(dim=2).mean(dim=1)  # (Bb,)
+                        mass_per_seq = abs_mu.sum(dim=2).mean(dim=1)  # (Bb,)
                         sum_mass[ell] += float(mass_per_seq.sum().item())
                         sum_log_mass[ell] += float(torch.log(mass_per_seq + 1e-30).sum().item())
                         count_seq[ell] += int(mass_per_seq.shape[0])
@@ -1592,15 +1484,7 @@ def run_for_model(args, model_name: str, mdir: str,
                     v_past_all = vseq[:, 0:(Tdg - ell), :]       # (Bb,T-ell,H)
                     psi = torch.sum(mu * delta_all * v_past_all, dim=2)  # (Bb,T-ell)
 
-                    # ---------------------------------------------------------------------
-                    # Matched-statistic sign orientation (global gauge; per lag)
-                    #
-                    # See baseline script for rationale. Summary:
-                    #   - We optionally apply psi <- sgn(E[psi]) psi so the empirical mean is >= 0.
-                    #   - This is a global orientation per lag (not per-neuron), used to ensure a
-                    #     consistent matched-statistic convention across architectures and runs.
-                    #   - Tail-index estimation is essentially reflection-invariant.
-                    # ---------------------------------------------------------------------
+                    # Optional global sign convention per lag.
                     if bool(args.orient_matched_statistic_sign):
                         mu_psi = psi.mean()
                         if torch.isfinite(mu_psi):
@@ -1611,25 +1495,13 @@ def run_for_model(args, model_name: str, mdir: str,
                             sgn = torch.tensor(1.0, device=psi.device)
                         psi = sgn * psi
 
-                    arr = psi.detach().cpu().numpy().astype(np.float64, copy=False).reshape(-1)
-                    off = write_offsets[ell]
-                    memmaps[ell][off:off + arr.size] = arr
-                    write_offsets[ell] = off + arr.size
-
-                    sum_psi[ell] += float(arr.sum())
-                    count_psi[ell] += int(arr.size)
+                    # Per-sequence means ψ̄_n(ℓ).
+                    psi_seq_means = psi.mean(dim=1).detach().cpu().numpy().astype(np.float64)  # (Bb,)
+                    psi_seq_lists[ell].append(psi_seq_means)
 
             del xb, yb, yhat, hseq, g, vseq, err, delta
             if device.type == "cuda" and args.cuda_sync:
                 torch.cuda.synchronize()
-
-        for ell in ells_list:
-            memmaps[ell].flush()
-
-        # sanity check: wrote exactly expected size per ell
-        for ell in ells_list:
-            if write_offsets[ell] != expected_sizes[ell]:
-                log(f"[warn:{model_name}] ell={ell}: write_offsets={write_offsets[ell]} expected={expected_sizes[ell]}")
 
         log(f"[run:{model_name}] diag stream done  dt={now_s()-t_diag0:.1f}s")
         log(f"[run:{model_name}] stats+write start")
@@ -1651,13 +1523,16 @@ def run_for_model(args, model_name: str, mdir: str,
             wcsv = csv.writer(f)
             wcsv.writerow([
                 "ell", "mu_l1_mean", "log_mu_l1_mean",
-                "f_gates", "f_adapt",
+                "f_gates", "f_ratio",
                 "lambda_mean", "lambda_std",
                 "alpha_ecf", "sigma_ecf", "alpha_ecf_reliable",
                 "alpha_mcc", "sigma_mcc", "alpha_mcc_reliable",
+                "alpha_mcc_ci_lo", "alpha_mcc_ci_hi",
+                "alpha_methods_agree",
+                "alpha_hat", "sigma_hat", "alpha_reliable", "alpha_method_used",
                 "N_required_ecf", "best_snr_ecf", "err_at_best_snr_ecf", "best_N_ecf",
                 "N_required_mcc", "best_snr_mcc", "err_at_best_snr_mcc", "best_N_mcc",
-                "mbar_scalar", "n_samples",
+                "mbar_scalar", "n_samples", "n_sequences",
             ])
 
             L = len(ells_list)
@@ -1672,8 +1547,7 @@ def run_for_model(args, model_name: str, mdir: str,
                     log_mu_mean = float(sum_log_mass[ell] / count_seq[ell])
                     mu_per_unit = (sum_unit[ell] / count_seq[ell]).astype(np.float64)
                     f_gates_ell = float(sum_mass_gates[ell] / count_seq[ell])
-                    f_adapt_ell = mu_mean - f_gates_ell
-                    # Per-lag adaptive base rate stats
+                    f_ratio_ell = float(mu_mean / f_gates_ell) if f_gates_ell > 1e-30 else float("nan")
                     if count_lambda[ell] > 0:
                         lam_m = sum_lambda_mean[ell] / count_lambda[ell]
                         lam_sq_m = sum_lambda_sq[ell] / count_lambda[ell]
@@ -1687,7 +1561,7 @@ def run_for_model(args, model_name: str, mdir: str,
                     log_mu_mean = float("-inf")
                     mu_per_unit = np.zeros(Hdim, dtype=np.float64)
                     f_gates_ell = 0.0
-                    f_adapt_ell = 0.0
+                    f_ratio_ell = float("nan")
                     lam_mean_ell = float(args.lr)
                     lam_std = 0.0
 
@@ -1695,79 +1569,120 @@ def run_for_model(args, model_name: str, mdir: str,
                 log_mu_by_ell[ell] = log_mu_mean
                 mu_units_by_ell[ell] = mu_per_unit
 
-                n_samples = expected_sizes[ell]
-                tmp_path = memmap_paths[ell]
-                T_seq = np.memmap(tmp_path, dtype=np.float64, mode="r", shape=(n_samples,))
+                psi_seq_arr = np.concatenate(psi_seq_lists[ell]) if psi_seq_lists[ell] else np.array([], dtype=np.float64)
+                n_seq = len(psi_seq_arr)
 
                 _run_ecf = "ecf" in args.alpha_methods
                 _run_mcc = "mcc" in args.alpha_methods
 
-                if n_samples == 0:
+                if n_seq == 0:
                     alpha_ecf, sigma_ecf, rel_ecf = 2.0, 0.0, False
                     alpha_mcc, sigma_mcc, rel_mcc = 2.0, 0.0, False
                     mbar = 0.0
                 else:
-                    samples_arr = np.asarray(T_seq)
                     if _run_ecf:
-                        alpha_ecf, sigma_ecf, rel_ecf = estimate_alpha_sigma(samples_arr, method="ecf")
+                        alpha_ecf, sigma_ecf, rel_ecf = estimate_alpha_sigma(psi_seq_arr, method="ecf")
                     else:
                         alpha_ecf, sigma_ecf, rel_ecf = float("nan"), float("nan"), False
                     if _run_mcc:
-                        alpha_mcc, sigma_mcc, rel_mcc = estimate_alpha_sigma(samples_arr, method="mcculloch")
+                        alpha_mcc, sigma_mcc, rel_mcc = estimate_alpha_sigma(psi_seq_arr, method="mcculloch")
                     else:
                         alpha_mcc, sigma_mcc, rel_mcc = float("nan"), float("nan"), False
-                    mean_raw = (sum_psi[ell] / max(1, count_psi[ell])) if count_psi[ell] > 0 else float(np.mean(samples_arr))
-                    mbar = float(abs(mean_raw))
+                    mbar = float(abs(np.mean(psi_seq_arr)))
 
                 alpha_by_ell_ecf[ell] = float(alpha_ecf)
                 alpha_by_ell_mcc[ell] = float(alpha_mcc)
 
-                # ECF-based detectability
+                # SNR and detectability.
                 best_snr_ecf_val, best_err_ecf, best_N_ecf, N_req_ecf = float("nan"), float("nan"), None, -1
                 if _run_ecf:
                     best_snr_ecf_val = -1e18
                     best_err_ecf = 1e18
                     for Nuse in args.N_grid:
-                        Nuse_eff = min(int(Nuse), max(1, n_samples))
-                        snr = compute_snr(alpha_ecf, sigma_ecf, mbar, Nuse_eff)
+                        Nuse = int(Nuse)
+                        snr = compute_snr(alpha_ecf, sigma_ecf, mbar, Nuse)
                         if (snr > args.eps) and (N_req_ecf == -1):
-                            N_req_ecf = int(Nuse_eff)
+                            N_req_ecf = Nuse
                         if snr > best_snr_ecf_val:
                             best_snr_ecf_val = snr
-                            best_err_ecf = detection_error_on_prefix(T_seq, int(Nuse_eff)) if n_samples > 0 else float("nan")
-                            best_N_ecf = int(Nuse_eff)
+                            Nuse_capped = min(Nuse, n_seq)
+                            best_err_ecf = detection_error_on_prefix_arr(psi_seq_arr, Nuse_capped) if n_seq > 0 else float("nan")
+                            best_N_ecf = Nuse
 
-                # McCulloch-based detectability
+                Nreq_by_ell_ecf[ell] = int(N_req_ecf)
+
                 best_snr_mcc_val, best_err_mcc, best_N_mcc, N_req_mcc = float("nan"), float("nan"), None, -1
                 if _run_mcc:
                     best_snr_mcc_val = -1e18
                     best_err_mcc = 1e18
                     for Nuse in args.N_grid:
-                        Nuse_eff = min(int(Nuse), max(1, n_samples))
-                        snr = compute_snr(alpha_mcc, sigma_mcc, mbar, Nuse_eff)
+                        Nuse = int(Nuse)
+                        snr = compute_snr(alpha_mcc, sigma_mcc, mbar, Nuse)
                         if (snr > args.eps) and (N_req_mcc == -1):
-                            N_req_mcc = int(Nuse_eff)
+                            N_req_mcc = Nuse
                         if snr > best_snr_mcc_val:
                             best_snr_mcc_val = snr
-                            best_err_mcc = detection_error_on_prefix(T_seq, int(Nuse_eff)) if n_samples > 0 else float("nan")
-                            best_N_mcc = int(Nuse_eff)
+                            Nuse_capped = min(Nuse, n_seq)
+                            best_err_mcc = detection_error_on_prefix_arr(psi_seq_arr, Nuse_capped) if n_seq > 0 else float("nan")
+                            best_N_mcc = Nuse
 
-                Nreq_by_ell_ecf[ell] = int(N_req_ecf)
                 Nreq_by_ell_mcc[ell] = int(N_req_mcc)
+
+                # Bootstrap confidence intervals for McCulloch estimate
+                alpha_mcc_ci_lo = float("nan")
+                alpha_mcc_ci_hi = float("nan")
+                alpha_mcc_median = alpha_mcc  # default to point estimate
+                if _run_mcc and n_seq >= 4:
+                    alpha_mcc_median, alpha_mcc_ci_lo, alpha_mcc_ci_hi, _ = bootstrap_mcculloch(
+                        psi_seq_arr,
+                        estimate_alpha_sigma_mcculloch_symmetric_from_quantiles,
+                        n_boot=args.alpha_n_boot,
+                        ci=0.95
+                    )
+
+                alpha_methods_agree = 0
+                if _run_ecf and _run_mcc and np.isfinite(alpha_ecf) and np.isfinite(alpha_mcc_ci_lo) and np.isfinite(alpha_mcc_ci_hi):
+                    if alpha_mcc_ci_lo <= alpha_ecf <= alpha_mcc_ci_hi:
+                        alpha_methods_agree = 1
+                elif not _run_ecf or not _run_mcc:
+                    alpha_methods_agree = 1
+
+                mcc_ci_width = (alpha_mcc_ci_hi - alpha_mcc_ci_lo) if (
+                    np.isfinite(alpha_mcc_ci_lo) and np.isfinite(alpha_mcc_ci_hi)
+                ) else float("inf")
+
+                if _run_ecf and rel_ecf:
+                    alpha_hat = alpha_ecf
+                    sigma_hat_unified = sigma_ecf
+                    alpha_reliable = True
+                    alpha_method_used = "ecf"
+                elif _run_mcc and np.isfinite(alpha_mcc):
+                    alpha_hat = float(alpha_mcc_median)
+                    sigma_hat_unified = sigma_mcc
+                    alpha_reliable = bool(mcc_ci_width < 0.3)
+                    alpha_method_used = "mcculloch"
+                else:
+                    alpha_hat = 2.0
+                    sigma_hat_unified = 0.0
+                    alpha_reliable = False
+                    alpha_method_used = "none"
 
                 wcsv.writerow([
                     int(ell), float(mu_mean), float(log_mu_mean),
-                    float(f_gates_ell), float(f_adapt_ell),
+                    float(f_gates_ell), float(f_ratio_ell),
                     float(lam_mean_ell), float(lam_std),
                     float(alpha_ecf), float(sigma_ecf), int(rel_ecf),
                     float(alpha_mcc), float(sigma_mcc), int(rel_mcc),
+                    float(alpha_mcc_ci_lo), float(alpha_mcc_ci_hi),
+                    int(alpha_methods_agree),
+                    float(alpha_hat), float(sigma_hat_unified), int(alpha_reliable), alpha_method_used,
                     int(N_req_ecf), float(best_snr_ecf_val), float(best_err_ecf), int(best_N_ecf if best_N_ecf is not None else -1),
                     int(N_req_mcc), float(best_snr_mcc_val), float(best_err_mcc), int(best_N_mcc if best_N_mcc is not None else -1),
-                    float(mbar), n_samples,
+                    float(mbar), n_seq * max(1, Tdg - ell), n_seq,
                 ])
 
-                del T_seq
-                try_remove(tmp_path)
+                # Free per-sequence list for this ell to release memory
+                del psi_seq_lists[ell]
 
         sorted_ells = sorted(mu_units_by_ell.keys())
         mu_units_path = os.path.join(mdir, f"{model_name}_mu_units.csv")
@@ -1788,6 +1703,7 @@ def run_for_model(args, model_name: str, mdir: str,
 
         # per-unit tau fits (always create outputs)
         tau_list = []
+        tau_mu_results = []
         tau_units_path = os.path.join(mdir, f"{model_name}_tau_from_mu_units.csv")
         with open(tau_units_path, "w", newline="") as f_tau:
             fieldnames = ["unit_id", "tau", "C", "a", "b", "r2", "num_points"]
@@ -1798,6 +1714,7 @@ def run_for_model(args, model_name: str, mdir: str,
                 fit_res = fit_exponential_tau(sorted_ells, np.abs(mu_vals_q), min_points=5)
                 if fit_res is not None:
                     tau_list.append(fit_res["tau"])
+                    tau_mu_results.append({"unit_id": q, **fit_res})
                     row = {"unit_id": q, **fit_res}
                     writer.writerow({k: row.get(k) for k in fieldnames})
 
@@ -1822,6 +1739,68 @@ def run_for_model(args, model_name: str, mdir: str,
                     "note": "No valid exponential fits (mu_unit too small/non-positive or insufficient points).",
                 }, jf, indent=2)
 
+        # Per-neuron Λ_q × τ_q correlation.
+        if len(tau_mu_results) >= 5:
+            tau_unit_ids = np.array([r["unit_id"] for r in tau_mu_results], dtype=int)
+            tau_vals = np.array([r["tau"] for r in tau_mu_results], dtype=float)
+            lam_vals = Lambda_q_rowmean[tau_unit_ids]
+
+            max_ell = max(mu_units_by_ell.keys())
+            mu_at_max_ell = mu_units_by_ell[max_ell][tau_unit_ids]
+
+            def _spearman_r(x, y):
+                n = len(x)
+                if n < 3:
+                    return float("nan")
+                rx = np.empty(n)
+                ry = np.empty(n)
+                rx[np.argsort(x)] = np.arange(n, dtype=float)
+                ry[np.argsort(y)] = np.arange(n, dtype=float)
+                rx -= rx.mean()
+                ry -= ry.mean()
+                denom = np.sqrt((rx ** 2).sum() * (ry ** 2).sum())
+                if denom < 1e-30:
+                    return float("nan")
+                return float((rx * ry).sum() / denom)
+
+            rho_lam_tau = _spearman_r(lam_vals, tau_vals)
+            pearson_lam_tau = float(np.corrcoef(lam_vals, tau_vals)[0, 1]) if len(lam_vals) >= 3 else float("nan")
+
+            log(f"[lambda_tau:{model_name}] Spearman ρ(Λ_q, τ_q) = {rho_lam_tau:.3f}, "
+                f"Pearson r = {pearson_lam_tau:.3f}  (n={len(tau_vals)} neurons)")
+
+            lt_csv_path = os.path.join(mdir, f"{model_name}_lambda_tau_correlation.csv")
+            with open(lt_csv_path, "w", newline="") as flt:
+                lt_writer = csv.writer(flt)
+                lt_writer.writerow(["neuron_q", "Lambda_q", "tau_q", "mu_at_max_ell"])
+                for j in range(len(tau_unit_ids)):
+                    lt_writer.writerow([
+                        int(tau_unit_ids[j]),
+                        float(lam_vals[j]),
+                        float(tau_vals[j]),
+                        float(mu_at_max_ell[j])
+                    ])
+
+            lt_stats = {
+                "model": model_name,
+                "n_neurons": int(len(tau_vals)),
+                "spearman_rho_lambda_tau": rho_lam_tau,
+                "pearson_r_lambda_tau": pearson_lam_tau,
+                "lambda_mean": float(lam_vals.mean()),
+                "lambda_std": float(lam_vals.std()),
+                "tau_mean": float(tau_vals.mean()),
+                "tau_std": float(tau_vals.std()),
+                "interpretation": (
+                    "slow_units_emphasized"
+                    if rho_lam_tau > 0.2 else
+                    "fast_units_emphasized"
+                    if rho_lam_tau < -0.2 else
+                    "approximately_uniform"
+                ),
+            }
+            with open(os.path.join(mdir, f"{model_name}_lambda_tau_stats.json"), "w") as jf:
+                json.dump(lt_stats, jf, indent=2)
+
         log(f"[run:{model_name}] stats+write done")
 
         return {
@@ -1836,12 +1815,9 @@ def run_for_model(args, model_name: str, mdir: str,
         }
 
     except Exception:
-        log(f"[ERROR:{model_name}] failed; cleaning temp files")
+        log(f"[ERROR:{model_name}] failed.")
         traceback.print_exc()
-        cleanup_all_tmp()
         raise
-    finally:
-        cleanup_all_tmp()
 
 
 # ============================================================
@@ -1919,6 +1895,11 @@ def parse_args():
                        "Minimum samples required for a reliable α̂ estimate. "
                        "Default: 500."
                    ))
+    p.add_argument("--alpha_n_boot", type=int, default=200,
+                   help=(
+                       "Number of bootstrap resamples for McCulloch confidence intervals. "
+                       "Default: 200."
+                   ))
 
     # --- JVP / matched statistic ------------------------------------------------
     p.add_argument("--w_seed", type=int, default=12345,
@@ -1950,12 +1931,10 @@ def parse_args():
     p.add_argument(
         "--orient_matched_statistic_sign",
         type=int,
-        default=1,
+        default=0,
         help=(
-            "If 1, orient matched-statistic samples per lag by sign(mean(psi)). "
-            "This applies a *global gauge* flip psi <- sgn(E[psi]) psi so the empirical mean "
-            "is nonnegative. Kept as a switch for ablations; reflection does not materially "
-            "affect symmetric tail-index estimation."
+            "If 1, flip samples per lag by sign(mean(psi)). "
+            "Default 0 keeps the raw matched statistic."
         )
     )
 

@@ -20,6 +20,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seed_utils
 
+# Subfolder for organizing output (relative to outdir)
+SUBFOLDER = "time_scales"
+
 CANDIDATE_MODELS = ["const", "shared", "diag", "gru", "lstm"]
 
 
@@ -561,6 +564,10 @@ def main():
 
     os.makedirs(args.outdir, exist_ok=True)
 
+    # Create subfolder for this script's outputs
+    plot_outdir = os.path.join(args.outdir, SUBFOLDER)
+    os.makedirs(plot_outdir, exist_ok=True)
+
     if args.hist and args.both:
         print("[warn] both --hist and --both set; using --both.")
         args.hist = False
@@ -583,7 +590,7 @@ def main():
     if not models:
         raise RuntimeError(f"No model tau files found in: {[os.path.abspath(d) for d in seed_dirs]}")
 
-    print(f"[info] outdir:   {os.path.abspath(args.outdir)}")
+    print(f"[info] outdir:   {os.path.abspath(plot_outdir)}")
     print(f"[info] detected models: {models}")
 
     # Load pooled tau data
@@ -614,21 +621,21 @@ def main():
         if tau_gate_all:
             if args.ccdf:
                 plot_overlay_ccdf(tau_gate_all, title="Time-scale distribution (gate-derived)",
-                                  outfile=os.path.join(args.outdir, f"{tag}tau_ccdf_gate_all.png"),
+                                  outfile=os.path.join(plot_outdir, f"{tag}tau_ccdf_gate_all.png"),
                                   args=args, n_seeds=n_seeds)
             else:
                 plot_overlay_pdf(tau_gate_all, title="Time-scale distribution (gate-derived)",
-                                 outfile=os.path.join(args.outdir, f"{tag}tau_pdf_gate_all.png"),
+                                 outfile=os.path.join(plot_outdir, f"{tag}tau_pdf_gate_all.png"),
                                  args=args, n_seeds=n_seeds)
 
         if tau_mu_all:
             if args.ccdf:
                 plot_overlay_ccdf(tau_mu_all, title=r"Time-scale distribution $\tau_q$",
-                                  outfile=os.path.join(args.outdir, f"{tag}tau_ccdf_all.png"),
+                                  outfile=os.path.join(plot_outdir, f"{tag}tau_ccdf_all.png"),
                                   args=args, n_seeds=n_seeds)
             else:
                 plot_overlay_pdf(tau_mu_all, title=r"Time-scale distribution $\tau_q$",
-                                 outfile=os.path.join(args.outdir, f"{tag}tau_pdf_all.png"),
+                                 outfile=os.path.join(plot_outdir, f"{tag}tau_pdf_all.png"),
                                  args=args, n_seeds=n_seeds)
 
     # ── PER-SEED VIEW ──
@@ -637,12 +644,12 @@ def main():
             if args.ccdf:
                 plot_overlay_ccdf_per_seed(tau_mu_per_seed,
                                            title=r"Time-scale distribution $\tau_q$",
-                                           outfile=os.path.join(args.outdir, f"{ps_tag}tau_ccdf_all.png"),
+                                           outfile=os.path.join(plot_outdir, f"{ps_tag}tau_ccdf_all.png"),
                                            args=args)
             else:
                 plot_overlay_pdf_per_seed(tau_mu_per_seed,
                                           title=r"Time-scale distribution $\tau_q$",
-                                          outfile=os.path.join(args.outdir, f"{ps_tag}tau_pdf_all.png"),
+                                          outfile=os.path.join(plot_outdir, f"{ps_tag}tau_pdf_all.png"),
                                           args=args)
 
     # ── SEPARATE MODE (per-model figures, unchanged) ──
@@ -652,11 +659,11 @@ def main():
             return
         for m, tau in tau_gate_all.items():
             plot_single_model_pdf(tau, title=f"Time-scale distribution — {m}",
-                                  outfile=os.path.join(args.outdir, f"tau_pdf_gate_{m}.png"),
+                                  outfile=os.path.join(plot_outdir, f"tau_pdf_gate_{m}.png"),
                                   args=args)
         for m, tau in tau_mu_all.items():
             plot_single_model_pdf(tau, title=rf"Time-scale distribution $\tau_q$ — {m}",
-                                  outfile=os.path.join(args.outdir, f"tau_pdf_{m}.png"),
+                                  outfile=os.path.join(plot_outdir, f"tau_pdf_{m}.png"),
                                   args=args)
 
     print("\nDone.")

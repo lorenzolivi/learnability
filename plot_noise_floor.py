@@ -19,6 +19,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seed_utils
 
+# Subfolder for organizing output (relative to outdir)
+SUBFOLDER = "noise_floor"
 
 # ── Helper functions for dual-alpha format ──
 def _alpha_col(method):
@@ -27,10 +29,14 @@ def _alpha_col(method):
 
 def _sigma_col(method):
     """Return column name for sigma_alpha given method."""
+    if method == "hat":
+        return "sigma_alpha_hat"  # old single-method format
     return f"sigma_{method}"
 
 def _nreq_col(method):
     """Return column name for N_required given method."""
+    if method == "hat":
+        return "N_required_at_eps"  # old single-method format
     return f"N_required_{method}"
 
 
@@ -320,20 +326,28 @@ def _plot_envelope_per_seed(seed_dirs, N_budgets, outpath):
     print(f"[ok] saved: {outpath}")
 
 
-def _plot_sigma_per_seed(seed_dirs, outpath):
-    """Plot per-seed sigma_alpha_hat traces overlaid."""
+def _plot_sigma_per_seed(seed_dirs, outpath, method="ecf"):
+    """Plot per-seed sigma_alpha traces overlaid."""
     plt.figure(figsize=(7.0, 4.2))
     legend_handles = {}
+    sigma_col = _sigma_col(method)  # e.g. "sigma_ecf"
 
     for model in seed_utils.CANDIDATE_MODELS:
+        # Try method-specific column first, fall back to old format
         traces = seed_utils.load_model_data_per_seed(
-            seed_dirs, model, {"ell", "sigma_alpha_hat"})
+            seed_dirs, model, {"ell", sigma_col})
+        if not traces:
+            traces = seed_utils.load_model_data_per_seed(
+                seed_dirs, model, {"ell", "sigma_alpha_hat"})
+            sigma_col_use = "sigma_alpha_hat"
+        else:
+            sigma_col_use = sigma_col
         if not traces:
             continue
         color = seed_utils.get_model_color(model)
         for i, (seed_label, df) in enumerate(traces):
             ell = df["ell"].to_numpy(dtype=float)
-            sig = df["sigma_alpha_hat"].to_numpy(dtype=float)
+            sig = df[sigma_col_use].to_numpy(dtype=float)
             mask = np.isfinite(ell) & np.isfinite(sig) & (sig > 0)
             if mask.sum() == 0:
                 continue
@@ -361,6 +375,10 @@ def main():
     outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
 
+    # Create subfolder for this script's outputs
+    plot_outdir = os.path.join(outdir, SUBFOLDER)
+    os.makedirs(plot_outdir, exist_ok=True)
+
     inputdirs = seed_utils.resolve_inputdirs(args)
     seed_dirs = seed_utils.discover_from_multiple_inputdirs(inputdirs)
 
@@ -379,11 +397,20 @@ def main():
         raise ValueError(f"--N_budgets must contain exactly two integers, got: {N_budgets}")
 
     print(f"[info] loading CSVs from: {', '.join(inputdirs)}")
-    print(f"[info] saving figures to: {os.path.abspath(outdir)}")
+    print(f"[info] saving figures to: {os.path.abspath(plot_outdir)}")
     print(f"[info] N budgets: {N_budgets}")
 
-    # Detect which alpha methods are available
-    alpha_methods = ["ecf", "mcc"]  # Try both; fall back to old format if needed
+    # Detect which alpha methods are available by probing a sample CSV
+    alpha_methods = ["hat"]  # default to old format
+    for model in seed_utils.CANDIDATE_MODELS:
+        per_seed = seed_utils.load_model_data_per_seed(seed_dirs, model)
+        if per_seed:
+            sample_df = per_seed[0][1]
+            if "alpha_ecf" in sample_df.columns:
+                alpha_methods = ["ecf", "mcc"]
+            elif "alpha_mcc" in sample_df.columns:
+                alpha_methods = ["mcc"]
+            break
 
     # Load and aggregate summaries for each model, detecting format
     summaries_by_method = {}
@@ -441,18 +468,19 @@ def main():
         # ── AGGREGATED VIEW ──
         if view in ("aggregated", "both"):
             _plot_envelope_eps_aggregated(summaries, ells, N_budgets,
-                                          os.path.join(outdir, f"{tag}envelope_with_eps_th{method_tag}.png"),
+                                          os.path.join(plot_outdir, f"{tag}envelope_with_eps_th{method_tag}.png"),
                                           is_multiseed, method=method)
             _plot_sigma_aggregated(summaries, ells,
-                                   os.path.join(outdir, f"{tag}sigma_alpha_hat_vs_ell{method_tag}.png"),
+                                   os.path.join(plot_outdir, f"{tag}sigma_alpha_hat_vs_ell{method_tag}.png"),
                                    is_multiseed, method=method)
 
         # ── PER-SEED VIEW ──
         if view in ("per_seed", "both"):
             _plot_envelope_per_seed(seed_dirs, N_budgets,
-                                    os.path.join(outdir, f"{ps_tag}envelope_with_eps_th{method_tag}.png"))
+                                    os.path.join(plot_outdir, f"{ps_tag}envelope_with_eps_th{method_tag}.png"))
             _plot_sigma_per_seed(seed_dirs,
-                                 os.path.join(outdir, f"{ps_tag}sigma_alpha_hat_vs_ell{method_tag}.png"))
+                                 os.path.join(plot_outdir, f"{ps_tag}sigma_alpha_hat_vs_ell{method_tag}.png"),
+                                 method=method)
 
         # Summary printout
         for name, df in summaries.items():

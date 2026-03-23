@@ -54,7 +54,7 @@ PLOT_STEPS = [
     },
     {
         "name": "envelope_decomp",
-        "label": "Envelope decomposition (f_gates vs f_adapt)",
+        "label": "Envelope decomposition (f_gates and shape correction R(ℓ))",
         "script": "plot_envelope_decomposition.py",
         "extra_args": [],
     },
@@ -63,7 +63,6 @@ PLOT_STEPS = [
         "label": "Tau distributions (CCDF)",
         "script": "plot_tau.py",
         "extra_args": ["--ccdf", "--logx", "--logy"],
-        "outdir_suffix": "/figures",
     },
     {
         "name": "N_vs_envelope",
@@ -82,14 +81,12 @@ PLOT_STEPS = [
         "label": "Noise floor / detectability",
         "script": "plot_noise_floor.py",
         "extra_args": ["--N_budgets", "500,8000"],
-        "outdir_suffix": "/figures",
     },
     {
         "name": "learning_curves",
         "label": "Learning curves",
         "script": "plot_learnability_learning_curves.py",
         "extra_args": [],
-        "outdir_suffix": "/plots_learning_curves",
     },
     {
         "name": "master_fit",

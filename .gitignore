@@ -15,8 +15,15 @@ build/
 
 # Folders
 latex/
-diagnostics/
 *results*/
+
+# Diagnostics: keep source/report, ignore generated artifacts
+diagnostics/*
+!diagnostics/*.py
+!diagnostics/*.md
+!diagnostics/*.sh
+diagnostics/__pycache__/
+diagnostics/envelope_approx_validation/
 
 # Session handoff
 SESSION_HANDOFF.md

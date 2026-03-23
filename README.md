@@ -60,7 +60,7 @@ SNR, sample complexity), and produces all figures in the paper.
 ├── plot_learnability_learning_curves.py# Training loss curves
 ├── fit_master_proportionality.py       # Master proportionality law fit
 ├── make_appendix_optimizer_figs.py     # Appendix: optimizer comparison figures
-├── plot_envelope_decomposition.py     # GELR envelope decomposition: f_gates(ℓ) vs f_adapt(ℓ)
+├── plot_envelope_decomposition.py     # GELR envelope decomposition: f_gates(ℓ) and shape correction R(ℓ)
 ├── launch_GELR_multiseed.sh           # Shell launcher for multi-seed GELR + decomposition runs
 ├── EXAMPLES.txt                        # Full CLI examples and workflow documentation
 ├── requirements.txt

@@ -556,3 +556,76 @@ def print_seed_info(seed_dirs: list[str], inputdirs: list[str]):
           f"({'multi-seed' if is_multi else 'single-seed'})")
     for sd in seed_dirs:
         print(f"  - {os.path.abspath(sd)}")
+
+
+# ── Bootstrap confidence intervals for McCulloch estimator ──────────────────
+
+def bootstrap_mcculloch(
+    samples: np.ndarray,
+    estimator_fn,
+    n_boot: int = 200,
+    ci: float = 0.95,
+) -> tuple[float, float, float, float]:
+    """
+    Compute bootstrap confidence intervals for McCulloch α and σ estimates.
+
+    Resamples the input samples with replacement n_boot times, applies the
+    McCulloch quantile-ratio estimator to each resample, and returns the
+    median point estimates plus confidence interval bounds for alpha.
+
+    Args:
+        samples: 1-D array of matched-statistic values (float64).
+        estimator_fn: A callable with signature:
+            estimator_fn(q05, q25, q75, q95) -> (alpha_hat, sigma_hat)
+            Typically estimate_alpha_sigma_mcculloch_symmetric_from_quantiles
+            from the DGX script. This function is passed rather than imported
+            to avoid circular imports.
+        n_boot: Number of bootstrap resamples (default: 200).
+        ci: Confidence interval level (default: 0.95 → 2.5th to 97.5th percentile).
+
+    Returns:
+        (alpha_median, alpha_ci_lo, alpha_ci_hi, sigma_median):
+            alpha_median: median α̂ across bootstrap samples
+            alpha_ci_lo: lower confidence bound (e.g., 2.5th percentile)
+            alpha_ci_hi: upper confidence bound (e.g., 97.5th percentile)
+            sigma_median: median σ̂ across bootstrap samples
+    """
+    n = len(samples)
+    if n < 4:
+        # Insufficient data; return defaults
+        return 2.0, 1.0, 2.0, 0.0
+
+    rng = np.random.RandomState(42)  # Deterministic for reproducibility
+    alpha_boots = []
+    sigma_boots = []
+
+    for _ in range(n_boot):
+        # Resample with replacement
+        idx = rng.choice(n, size=n, replace=True)
+        boot_samples = samples[idx]
+
+        # Compute quantiles
+        q05 = float(np.quantile(boot_samples, 0.05))
+        q25 = float(np.quantile(boot_samples, 0.25))
+        q75 = float(np.quantile(boot_samples, 0.75))
+        q95 = float(np.quantile(boot_samples, 0.95))
+
+        # Apply McCulloch estimator
+        alpha_hat, sigma_hat = estimator_fn(q05, q25, q75, q95)
+        alpha_boots.append(float(alpha_hat))
+        sigma_boots.append(float(sigma_hat))
+
+    # Compute statistics
+    alpha_boots = np.array(alpha_boots, dtype=np.float64)
+    sigma_boots = np.array(sigma_boots, dtype=np.float64)
+
+    alpha_median = float(np.median(alpha_boots))
+    sigma_median = float(np.median(sigma_boots))
+
+    # Confidence interval bounds
+    alpha_lower = (1.0 - ci) / 2.0  # e.g., 0.025 for 95% CI
+    alpha_upper = 1.0 - alpha_lower   # e.g., 0.975 for 95% CI
+    alpha_ci_lo = float(np.quantile(alpha_boots, alpha_lower))
+    alpha_ci_hi = float(np.quantile(alpha_boots, alpha_upper))
+
+    return alpha_median, alpha_ci_lo, alpha_ci_hi, sigma_median

@@ -22,6 +22,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seed_utils
 
+# Subfolder for organizing output (relative to outdir)
+SUBFOLDER = "sample_complexity"
+
 CANDIDATE_MODELS = ["const", "shared", "diag", "gru", "lstm"]
 
 
@@ -32,6 +35,8 @@ def _alpha_col(method):
 
 def _nreq_col(method):
     """Return column name for N_required given method."""
+    if method == "hat":
+        return "N_required_at_eps"  # old single-method format
     return f"N_required_{method}"
 
 
@@ -53,33 +58,58 @@ def parse_args():
     return p.parse_args()
 
 
-def load_summaries_across_seeds(seed_dirs, model):
+def load_summaries_across_seeds(seed_dirs, model, method=None):
     """
     Load <model>_summary.csv from each seed dir.
     Returns list of DataFrames (one per seed with the file).
     """
-    return seed_utils.load_model_summary_across_seeds(
+    required_cols = {"ell", "mu_l1_mean"}
+
+    if method is None:
+        return seed_utils.load_model_summary_across_seeds(
+            seed_dirs,
+            model,
+            required_cols=required_cols,
+        )
+
+    nreq_col = _nreq_col(method)
+    dfs = seed_utils.load_model_summary_across_seeds(
         seed_dirs,
         model,
-        required_cols={"ell", "mu_l1_mean", "N_required_at_eps"}
+        required_cols=required_cols | {nreq_col},
     )
+    if dfs:
+        return dfs
+
+    if nreq_col != "N_required_at_eps":
+        return seed_utils.load_model_summary_across_seeds(
+            seed_dirs,
+            model,
+            required_cols=required_cols | {"N_required_at_eps"},
+        )
+
+    return []
 
 
-def aggregate_summaries(dfs):
+def aggregate_summaries(dfs, method):
     """
     Aggregate list of summary DataFrames across seeds.
-    For each lag ell, compute mean and std of mu_l1_mean and N_required_at_eps.
+    For each lag ell, compute mean and std of mu_l1_mean and the
+    method-specific sample-complexity column.
 
     Returns a DataFrame with columns:
-      ell, mu_l1_mean_mean, mu_l1_mean_std, N_required_at_eps_mean, N_required_at_eps_std
+      ell, mu_l1_mean_mean, mu_l1_mean_std, <N_required_col>_mean, <N_required_col>_std
     """
     if not dfs:
         return pd.DataFrame()
 
+    nreq_col = _nreq_col(method)
+    nreq_col_to_use = nreq_col if nreq_col in dfs[0].columns else "N_required_at_eps"
+
     return seed_utils.aggregate_numeric_by_key(
         dfs,
         key_col="ell",
-        value_cols=["mu_l1_mean", "N_required_at_eps"]
+        value_cols=["mu_l1_mean", nreq_col_to_use],
     )
 
 
@@ -173,14 +203,16 @@ def plot_model_with_individual_seeds(model, dfs, agg_df, outfile, method: str = 
         print(f"[ok] {model} ({method}): saved {outfile} | fit skipped (need >=2 points)")
 
 
-def plot_model_per_seed(model, seed_traces, outfile):
+def plot_model_per_seed(model, seed_traces, outfile, nreq_col="N_required_at_eps"):
     """Plot per-seed scatter with color-coded seeds and per-seed fits."""
     fig, ax = plt.subplots(figsize=(6, 4))
     color = seed_utils.get_model_color(model)
 
     for i, (seed_label, df) in enumerate(seed_traces):
         mu_vals = df["mu_l1_mean"].to_numpy(dtype=float)
-        Nreq_vals = df["N_required_at_eps"].to_numpy(dtype=float)
+        # Use method-specific column, fall back to old format
+        col = nreq_col if nreq_col in df.columns else "N_required_at_eps"
+        Nreq_vals = df[col].to_numpy(dtype=float)
         mask = np.isfinite(mu_vals) & (mu_vals > 0) & np.isfinite(Nreq_vals) & (Nreq_vals > 0)
         if not np.any(mask):
             continue
@@ -216,7 +248,11 @@ def main():
     outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
 
-    print(f"[info] saving figures to: {os.path.abspath(outdir)}")
+    # Create subfolder for this script's outputs
+    plot_outdir = os.path.join(outdir, SUBFOLDER)
+    os.makedirs(plot_outdir, exist_ok=True)
+
+    print(f"[info] saving figures to: {os.path.abspath(plot_outdir)}")
     print(f"[info] view mode: {view}")
 
     seed_utils.print_seed_info(seed_dirs, inputdirs)
@@ -260,7 +296,7 @@ def main():
         for mname in models:
             print(f"  [model] {mname}")
 
-            dfs = load_summaries_across_seeds(seed_dirs, mname)
+            dfs = load_summaries_across_seeds(seed_dirs, mname, method=method)
             if not dfs:
                 print(f"[warn] {mname}: no summary files found.")
                 continue
@@ -269,9 +305,9 @@ def main():
 
             # ── AGGREGATED VIEW ──
             if view in ("aggregated", "both"):
-                agg_df = aggregate_summaries(dfs)
+                agg_df = aggregate_summaries(dfs, method)
                 if not agg_df.empty:
-                    outpath = os.path.join(outdir, f"{tag}N_vs_mu_{mname}{method_tag}.png")
+                    outpath = os.path.join(plot_outdir, f"{tag}N_vs_mu_{mname}{method_tag}.png")
                     plot_model_with_individual_seeds(mname, dfs, agg_df, outpath, method=method)
 
             # ── PER-SEED VIEW ──
@@ -279,8 +315,9 @@ def main():
                 required = {"ell", "mu_l1_mean", _nreq_col(method) if method != "hat" else "N_required_at_eps"}
                 seed_traces = seed_utils.load_model_data_per_seed(seed_dirs, mname, required)
                 if seed_traces:
-                    outpath = os.path.join(outdir, f"{ps_tag}N_vs_mu_{mname}{method_tag}.png")
-                    plot_model_per_seed(mname, seed_traces, outpath)
+                    outpath = os.path.join(plot_outdir, f"{ps_tag}N_vs_mu_{mname}{method_tag}.png")
+                    nreq = _nreq_col(method) if method != "hat" else "N_required_at_eps"
+                    plot_model_per_seed(mname, seed_traces, outpath, nreq_col=nreq)
 
     print("\n[done] scaling plot complete")
 
