@@ -141,6 +141,71 @@ def find_json_in_seed_dir(seed_dir: str, json_name: str, model: str = None) -> O
     return find_file_in_seed_dir(seed_dir, json_name, model)
 
 
+def find_dense_artifact_in_seed_dir(seed_dir: str, stem: str, model: str = None) -> Optional[str]:
+    """
+    Find a dense artifact stored as NPZ (preferred) or legacy CSV.
+
+    Args:
+        seed_dir: Seed directory to search.
+        stem: File stem without extension, e.g. "lstm_mu_units".
+        model: Optional model subdirectory hint for nested layouts.
+
+    Returns:
+        Path to <stem>.npz if present, otherwise <stem>.csv, else None.
+    """
+    for ext in (".npz", ".csv"):
+        path = find_file_in_seed_dir(seed_dir, f"{stem}{ext}", model)
+        if path is not None:
+            return path
+    return None
+
+
+def load_dense_unit_artifact(
+    path: str,
+    value_keys: Optional[list[str]] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Load a dense per-lag/per-unit artifact from NPZ or legacy CSV.
+
+    NPZ files must contain:
+      - ell:    (L,) lag grid
+      - one value matrix, typically stored under "values"
+
+    Legacy CSV files are interpreted as:
+      - first column: ell/lag
+      - remaining columns: per-unit values
+    """
+    if value_keys is None:
+        value_keys = [
+            "values",
+            "mu_total",
+            "mu_units",
+            "mu_gates",
+            "zero_order_values",
+            "first_order_values",
+        ]
+
+    if path.endswith(".npz"):
+        with np.load(path, allow_pickle=False) as data:
+            if "ell" not in data:
+                raise ValueError(f"NPZ artifact missing 'ell' array: {path}")
+            value_key = next((k for k in value_keys if k in data), None)
+            if value_key is None:
+                raise ValueError(
+                    f"NPZ artifact missing a value matrix. Tried keys {value_keys} in {path}"
+                )
+            ell = np.asarray(data["ell"], dtype=np.float64)
+            values = np.asarray(data[value_key], dtype=np.float64)
+        return ell, values
+
+    df = pd.read_csv(path)
+    cols = {c.lower(): c for c in df.columns}
+    ell_col = cols.get("ell", cols.get("lag", cols.get("l", df.columns[0])))
+    ell = pd.to_numeric(df[ell_col], errors="coerce").to_numpy(dtype=np.float64)
+    values = df.drop(columns=[ell_col]).apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
+    return ell, values
+
+
 # ── CSV loading across seeds ───────────────────────────────────────────
 
 def load_csv_across_seeds(
@@ -388,11 +453,11 @@ def detect_models_in_dirs(dirs: list[str]) -> list[str]:
 
 
 def detect_models_with_mu_units(dirs: list[str]) -> list[str]:
-    """Detect models that have mu_units or tau CSVs (flat or nested)."""
+    """Detect models that have mu_units artifacts or tau CSVs (flat or nested)."""
     found = set()
     for d in dirs:
         for m in CANDIDATE_MODELS:
-            if (find_file_in_seed_dir(d, f"{m}_mu_units.csv", m) is not None or
+            if (find_dense_artifact_in_seed_dir(d, f"{m}_mu_units", m) is not None or
                 find_file_in_seed_dir(d, f"{m}_tau_from_mu_units.csv", m) is not None):
                 found.add(m)
     return [m for m in CANDIDATE_MODELS if m in found]
@@ -578,7 +643,7 @@ def bootstrap_mcculloch(
         estimator_fn: A callable with signature:
             estimator_fn(q05, q25, q75, q95) -> (alpha_hat, sigma_hat)
             Typically estimate_alpha_sigma_mcculloch_symmetric_from_quantiles
-            from the DGX script. This function is passed rather than imported
+            from the main training script. This function is passed rather than imported
             to avoid circular imports.
         n_boot: Number of bootstrap resamples (default: 200).
         ci: Confidence interval level (default: 0.95 → 2.5th to 97.5th percentile).
@@ -590,6 +655,7 @@ def bootstrap_mcculloch(
             alpha_ci_hi: upper confidence bound (e.g., 97.5th percentile)
             sigma_median: median σ̂ across bootstrap samples
     """
+    samples = np.asarray(samples, dtype=np.float64)
     n = len(samples)
     if n < 4:
         # Insufficient data; return defaults

@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Empirical learnability-window pipeline for GRU and LSTM models."""
 
-import argparse
-import csv
-import json
-import math
-import os
-import time
-import traceback
+# =============================================================================
+# Empirical learnability-window pipeline for baseline gated RNNs.
+#
+# Trains ConstGate, SharedGate, and DiagGate models on the synthetic delayed
+# regression task, computes per-lag learnability diagnostics, and writes the
+# per-model summaries used by the analysis scripts.
+# =============================================================================
+
+import argparse, os, math, csv, json, traceback, time
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 import torch
@@ -22,36 +23,65 @@ from seed_utils import bootstrap_mcculloch
 
 
 # ============================================================
-# Small utilities
+# Compact logger
 # ============================================================
 
-def save_args_to_csv(args, filepath: str) -> None:
-    """Dump all CLI arguments to a two-column CSV for reproducibility."""
-    with open(filepath, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["argument", "value"])
-        for k, v in vars(args).items():
-            w.writerow([k, v])
-
-def set_seed(seed: int) -> None:
-    """Set random seeds for numpy, torch CPU, and all CUDA devices."""
-    np.random.seed(int(seed))
-    torch.manual_seed(int(seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(seed))
-
-def layernorm_if(enabled: bool, dim: int) -> nn.Module:
-    """Return a LayerNorm module if enabled, otherwise nn.Identity (no-op)."""
-    return nn.LayerNorm(dim) if enabled else nn.Identity()
-
-def now_s() -> float:
-    """Current wall-clock time in seconds (for timing diagnostics)."""
-    return time.time()
-
-def log(msg: str) -> None:
+def log(msg: str):
     """Print a timestamped log message (flushed immediately)."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+
+
+
+
+# ============================================================
+# Utils
+# ============================================================
+
+def save_args_to_csv(args, filepath):
+    """Dump all CLI arguments to a two-column CSV for reproducibility."""
+    with open(filepath, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["argument", "value"])
+        for k, v in vars(args).items():
+            writer.writerow([k, v])
+
+
+def save_dense_unit_npz(
+    filepath: str,
+    ell_values: np.ndarray,
+    value_matrix: np.ndarray,
+    *,
+    component: str,
+    rate_scale: str,
+    extra_arrays: Optional[Dict[str, np.ndarray]] = None,
+) -> None:
+    """Save a dense per-lag/per-unit artifact as a compact NPZ bundle."""
+    payload = {
+        "ell": np.asarray(ell_values, dtype=np.int64),
+        "values": np.asarray(value_matrix, dtype=np.float64),
+        "unit_ids": np.arange(value_matrix.shape[1], dtype=np.int64),
+        "component": np.array(component),
+        "rate_scale": np.array(rate_scale),
+    }
+    if extra_arrays:
+        for key, value in extra_arrays.items():
+            payload[key] = np.asarray(value, dtype=np.float64)
+    np.savez_compressed(filepath, **payload)
+
+
+def set_seed(seed: int):
+    """Set random seeds for numpy, torch CPU, and all CUDA devices."""
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    torch.cuda.manual_seed_all(int(seed))
+
+
+def layernorm_if(enabled: bool, dim: int):
+    """Return a LayerNorm module if enabled, otherwise nn.Identity (no-op)."""
+    return nn.LayerNorm(dim) if enabled else nn.Identity()
 
 
 # ============================================================
@@ -87,7 +117,7 @@ def compute_adaptive_base_rates(
     # Collect all recurrent weight matrices (H×H)
     recurrent_params = []
     for name, param in model.named_parameters():
-        # Match recurrent weight matrices: U*.weight with shape (H, H)
+        # Match recurrent weight matrices: Wh.weight with shape (H, H)
         if param.shape == (H, H) and "weight" in name and "out" not in name:
             recurrent_params.append((name, param))
 
@@ -135,7 +165,7 @@ def compute_adaptive_base_rates(
             continue
 
         # Per-parameter adaptive rates: λ_{qj} = lr / (sqrt(v̂_{qj}) + ε)
-        lam = lr / (torch.sqrt(v_hat.float()) + eps)  # (H, H)
+        lam = lr / (torch.sqrt(v_hat.double()) + eps)  # (H, H)
 
         # Row mean: Λ^(q, U•)_r = (1/H) Σ_j λ_{qj}
         row_mean = lam.mean(dim=1)  # (H,)
@@ -214,7 +244,7 @@ def extract_adaptive_rate_matrix(
             log(f"[adaptive_rate_matrix] {name}: non-finite v_hat, skipping")
             continue
 
-        lam = lr / (torch.sqrt(v_hat.float()) + eps)  # (H, H)
+        lam = lr / (torch.sqrt(v_hat.double()) + eps)  # (H, H)
         lam_matrices.append(lam)
 
     if not lam_matrices:
@@ -250,7 +280,8 @@ def compute_lag_dependent_rates(
     Args:
         lambda_matrix: (H, H) per-parameter adaptive rate matrix λ_{qj}.
         hseq:          (B, T, H) hidden state sequence from forward pass.
-        T_valid:       number of valid time positions.
+        T_valid:       number of valid time positions (T-ℓ+1 for envelope,
+                       T-ℓ for matched stat).
         fallback_rate: (H,) rate to use when h=0 (typically the row mean).
 
     Returns:
@@ -258,29 +289,28 @@ def compute_lag_dependent_rates(
     """
     B, T_full, H = hseq.shape
     device = hseq.device
-    dtype = hseq.dtype
-
     # Pre-synaptic hidden states at perturbation times:
     #   position k=0 → h_{-1} = 0 (initial state)
     #   position k≥1 → h_{k-1} = hseq[:, k-1, :]
-    h_pre = torch.zeros(B, T_valid, H, device=device, dtype=dtype)
+    h_pre = torch.zeros(B, T_valid, H, device=device, dtype=torch.float64)
     n_copy = min(T_valid - 1, T_full)
     if n_copy > 0:
-        h_pre[:, 1:1+n_copy, :] = hseq[:, :n_copy, :]
+        h_pre[:, 1:1+n_copy, :] = hseq[:, :n_copy, :].double()
 
     h_sq = h_pre ** 2  # (B, T_valid, H)
     h_sq_sum = h_sq.sum(dim=2, keepdim=True)  # (B, T_valid, 1)
 
     # Rayleigh quotient: Λ[b,t,q] = Σ_j λ[q,j] h²[b,t,j] / Σ_j h²[b,t,j]
-    numer = torch.matmul(h_sq.float(), lambda_matrix.T.float())  # (B, T_valid, H)
+    #   h_sq @ λᵀ → (B, T_valid, H=q)  with  [b,t,q] = Σ_j h²[b,t,j] λ[q,j]
+    numer = torch.matmul(h_sq, lambda_matrix.T.double())  # (B, T_valid, H)
 
     # Avoid division by zero: mask positions with h=0
     zero_mask = (h_sq_sum.squeeze(-1) < 1e-30)  # (B, T_valid)
-    Lambda_ell = numer / (h_sq_sum.float() + 1e-30)  # (B, T_valid, H)
+    Lambda_ell = numer / (h_sq_sum + 1e-30)  # (B, T_valid, H)
 
     # Replace h=0 positions with fallback (row-mean) rate
     if zero_mask.any():
-        Lambda_ell[zero_mask] = fallback_rate.float().unsqueeze(0)
+        Lambda_ell[zero_mask] = fallback_rate.double().unsqueeze(0)
 
     return Lambda_ell
 
@@ -300,7 +330,10 @@ def _eval_streaming_mse_and_r2(
     Compute MSE loss and R² in streaming batches (CPU→GPU).
 
     Uses return_intermediates=False to avoid materialising diagnostic
-    tensors (leak, rdiag, gate activations) during evaluation.
+    tensors (leak, rdiag, gate_s) during evaluation.
+
+    R² = 1 - SSE/SST is the coefficient of determination; a value of 0
+    means the model predicts the mean, and 1 means perfect prediction.
     """
     model.eval()
     Btot = int(X_cpu.shape[0])
@@ -349,17 +382,22 @@ def _eval_streaming_mse_and_r2(
 # ============================================================
 # JVP utilities
 #
-# Compute the Jacobian-vector product v_t = (∂h_t/∂θ)[w] where
-# w is a random unit-norm direction in parameter space.  Uses
-# torch.func.jvp (forward-mode AD) for memory efficiency.
+# These compute the Jacobian-vector product  v_t = (∂h_t/∂θ)[w]
+# where w is a random unit-norm direction in parameter space.
+# The JVP is computed via torch.func.jvp (forward-mode AD), which
+# is memory-efficient: it does not materialise the full Jacobian.
 # ============================================================
 
 def _make_random_unit_w_pytree(model: nn.Module, device: torch.device, seed: int):
     """
     Build a random unit-norm tangent vector w in parameter space.
 
-    Returns (params0, buffers, w) where w has ||w||₂ = 1 across all
-    parameters jointly.  The seed is fixed across lags/batches.
+    Returns:
+        params0: dict of trainable parameters (name -> tensor).
+        buffers:  dict of model buffers (name -> tensor).
+        w:        dict of tangent vectors, same structure as params0,
+                  with ||w||₂ = 1 across all parameters jointly.
+    The seed is fixed so the same direction is used across all lags/batches.
     """
     g = torch.Generator(device=device)
     g.manual_seed(int(seed))
@@ -381,17 +419,18 @@ def _make_random_unit_w_pytree(model: nn.Module, device: torch.device, seed: int
 
     return params0, buffers, w
 
+
 def compute_vseq_jvp(model: nn.Module, X: torch.Tensor, w_seed: int) -> torch.Tensor:
     """
-    Compute the hidden-state JVP sequence v_t = (∂h_t/∂θ)[w].
+    Compute the hidden-state JVP sequence  v_t = (∂h_t/∂θ)[w].
 
     Args:
-        model:   trained model (GRU or LSTM).
+        model:   trained RNN model.
         X:       input tensor (B, T, D), already on device.
         w_seed:  seed for the random tangent direction w.
 
     Returns:
-        vseq: (B, T, H) per-timestep JVP values.
+        vseq: tensor (B, T, H) of per-timestep JVP values.
     """
     device = X.device
     model.eval()
@@ -412,17 +451,141 @@ def compute_vseq_jvp(model: nn.Module, X: torch.Tensor, w_seed: int) -> torch.Te
 
 
 # ============================================================
+# Memory-kernel window helpers (prefix-sum based)
+#
+# The learnability theory factorises the per-unit Jacobian as a product
+# of per-step diagonal terms.  For the simple gated RNN:
+#
+#   ∂h_t^(q) / ∂h_{t-ℓ}^(q)  ≈  Π_{j=t-ℓ+1}^{t}  leak_j^(q)
+#                                + first-order correction from rdiag
+#
+# where  leak_j = (1 - s_j)  is the retention coefficient and
+#        rdiag_j = diag(∂h_j/∂h_{j-1}) - leak_j  captures the
+#        recurrent-weight and gate-derivative contributions.
+#
+# We compute these ℓ-step products efficiently using cumulative sums
+# in log-space (for the product) and a ratio accumulator (for the
+# first-order correction).  This avoids the O(T×L) naive loop.
+# ============================================================
+
+def precompute_prefix_sums(leak: torch.Tensor, rdiag: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build prefix-sum arrays for fast ℓ-step window computation.
+
+    Args:
+        leak:   (B, T, H) per-step retention coefficients (1 - s_t).
+        rdiag:  (B, T, H) diagonal correction term.
+
+    Returns:
+        cs_log:   (B, T+1, H) cumulative sum of log(leak), for computing
+                  products  Π leak[j]  via  exp(cs_log[t2] - cs_log[t1]).
+        cs_ratio: (B, T+1, H) cumulative sum of rdiag/leak, for computing
+                  the first-order correction  Σ (rdiag[j] / leak[j]).
+    """
+    with torch.no_grad():
+        B, T, H = leak.shape
+        device = leak.device
+
+        leak64 = torch.clamp(leak.double(), 1e-12, 1.0)
+        log_leak = torch.log(leak64)
+        cs_log = torch.zeros(B, T + 1, H, dtype=torch.float64, device=device)
+        cs_log[:, 1:, :] = torch.cumsum(log_leak, dim=1)
+
+        ratio = (rdiag.double() / leak64).to(torch.float64)
+        cs_ratio = torch.zeros(B, T + 1, H, dtype=torch.float64, device=device)
+        cs_ratio[:, 1:, :] = torch.cumsum(ratio, dim=1)
+
+        return cs_log, cs_ratio
+
+
+def mu_for_matched_stat_from_prefix(cs_log: torch.Tensor, cs_ratio: torch.Tensor, ell: int, out_dtype: torch.dtype):
+    """
+    Extract the memory kernel μ(ℓ) for the matched-statistic computation.
+
+    Uses a *shifted* window: product from step (t-ℓ+1) to step t, aligned
+    so that mu[b, t, q] corresponds to the kernel connecting h_{t} back to
+    h_{t-ℓ}.  This is the kernel used inside ψ_t(ℓ) = Σ_q μ δ v.
+
+    Returns:
+        mu0:  (B, T-ℓ, H) zero-order term (product of leaks).
+        mu1:  (B, T-ℓ, H) first-order correction.
+        mu:   (B, T-ℓ, H) total kernel  mu0 + mu1.
+    """
+    B, Tp1, H = cs_log.shape
+    T = Tp1 - 1
+    if ell <= 0 or ell >= T:
+        z = torch.zeros(B, 0, H, dtype=out_dtype, device=cs_log.device)
+        return z, z, z
+
+    with torch.no_grad():
+        log_prod = cs_log[:, (ell + 1):(T + 1), :] - cs_log[:, 1:(T - ell + 1), :]
+        mu0 = torch.exp(log_prod).to(out_dtype)
+
+        sum_ratio = cs_ratio[:, (ell + 1):(T + 1), :] - cs_ratio[:, 1:(T - ell + 1), :]
+        mu1 = (mu0.double() * sum_ratio).to(out_dtype)
+
+        return mu0, mu1, (mu0 + mu1)
+
+
+def mu_for_envelope_from_prefix(
+    cs_log: torch.Tensor,
+    cs_ratio: torch.Tensor,
+    ell: int,
+    out_dtype: torch.dtype,
+):
+    """
+    Extract the memory kernel μ(ℓ) for the envelope f̂(ℓ) computation.
+
+    Uses an *unshifted* window starting from step 0, so we get the
+    absolute magnitude of information retained over ℓ steps.  The
+    envelope is computed as  f̂(ℓ) = mean over (batch, time, units)
+    of |μ_envelope(ℓ)|.
+
+    Returns:
+        mu0_env: (B, T-ℓ+1, H) zero-order gate-only term.
+        mu1_env: (B, T-ℓ+1, H) first-order correction.
+        mu_env:  (B, T-ℓ+1, H) total kernel (zero-order + first-order).
+    """
+    B, Tp1, H = cs_log.shape
+    T = Tp1 - 1
+    if ell <= 0 or ell > T:
+        z = torch.zeros(B, 0, H, dtype=out_dtype, device=cs_log.device)
+        return z, z, z
+
+    with torch.no_grad():
+        log_prod = cs_log[:, ell:(T + 1), :] - cs_log[:, 0:(T - ell + 1), :]
+        mu0 = torch.exp(log_prod).to(out_dtype)
+
+        sum_ratio = cs_ratio[:, ell:(T + 1), :] - cs_ratio[:, 0:(T - ell + 1), :]
+        mu1 = (mu0.double() * sum_ratio).to(out_dtype)
+
+        return mu0, mu1, (mu0 + mu1)
+
+
+# ============================================================
 # McCulloch quantile estimator for symmetric α-stable (SαS)
 #
-# Estimates the tail index α ∈ [1, 2] from the ratio of
-# inter-quantile ranges R̂ = (q95-q05)/(q75-q25).  A pre-computed
-# grid mapping R → α is built at module load time using scipy's
-# levy_stable (or a hardcoded fallback table if scipy is absent).
-# See the baselines script for a more detailed explanation.
+# The matched statistic ψ_t(ℓ) is modelled as a symmetric stable
+# random variable with tail index α ∈ [1, 2].  The McCulloch method
+# estimates α from the ratio of inter-quantile ranges:
+#
+#   R̂ = (q95 - q05) / (q75 - q25)
+#
+# We pre-compute a grid mapping R → α from the theoretical SαS
+# quantiles (via scipy.stats.levy_stable if available, else a
+# hardcoded fallback table), then invert via linear interpolation.
+#
+# The scale σ̂ is estimated from the IQR / theoretical IQR ratio.
 # ============================================================
 
 class _StableQuantileCache:
-    """Cached theoretical quantile grid for the McCulloch SαS estimator."""
+    """
+    Cached theoretical quantile grid for the McCulloch SαS estimator.
+
+    At module load time, builds a sorted lookup table mapping the
+    quantile ratio R to tail index α.  This makes per-lag estimation
+    a simple np.interp call (no scipy overhead in the hot loop).
+    """
     def __init__(self):
         self._have_scipy = False
         self.levy_stable = None
@@ -434,15 +597,22 @@ class _StableQuantileCache:
             self._have_scipy = False
             self.levy_stable = None
 
-        # fallback (alpha, R, IQR) for symmetric stable
+        # Fallback grid if SciPy is missing.
         self.fallback = np.array([
-            [2.00, 1.903, 1.349], [1.90, 2.020, 1.404], [1.80, 2.160, 1.472],
-            [1.70, 2.330, 1.556], [1.60, 2.545, 1.662], [1.50, 2.820, 1.802],
-            [1.40, 3.180, 2.000], [1.30, 3.670, 2.289], [1.20, 4.390, 2.781],
-            [1.10, 5.560, 3.865], [1.00, 7.430, 6.314],
+            [2.00, 1.903, 1.349],
+            [1.90, 2.020, 1.404],
+            [1.80, 2.160, 1.472],
+            [1.70, 2.330, 1.556],
+            [1.60, 2.545, 1.662],
+            [1.50, 2.820, 1.802],
+            [1.40, 3.180, 2.000],
+            [1.30, 3.670, 2.289],
+            [1.20, 4.390, 2.781],
+            [1.10, 5.560, 3.865],
+            [1.00, 7.430, 6.314],
         ], dtype=float)
 
-        self.cache_q: Dict[float, Tuple[float, float, float, float, float]] = {}
+        self.cache_q = {}
         self._grid_ready = False
         self._R_SORT = None
         self._A_SORT = None
@@ -466,7 +636,7 @@ class _StableQuantileCache:
             q95 = 0.5 * r * iqr
             q05 = -q95
             q50 = 0.0
-            out = (float(q05), float(q25), float(q50), float(q75), float(q95))
+            out = (q05, q25, q50, q75, q95)
 
         self.cache_q[key] = out
         return out
@@ -477,24 +647,33 @@ class _StableQuantileCache:
         alpha_grid = np.linspace(1.0, 2.0, int(n_grid))
         r_grid = np.empty_like(alpha_grid)
         iqr_grid = np.empty_like(alpha_grid)
-
         for i, a in enumerate(alpha_grid):
             q05, q25, _, q75, q95 = self.theo_quantiles(float(a))
             denom = (q75 - q25) + 1e-12
             r_grid[i] = (q95 - q05) / denom
             iqr_grid[i] = (q75 - q25)
-
         order = np.argsort(r_grid)
         self._R_SORT = r_grid[order]
         self._A_SORT = alpha_grid[order]
         self._IQR_SORT = iqr_grid[order]
         self._grid_ready = True
 
+
 _STABLE_CACHE = _StableQuantileCache()
 _STABLE_CACHE.ensure_grid(201)
 
+
 def estimate_alpha_sigma_mcculloch_symmetric_from_quantiles(q05, q25, q75, q95) -> Tuple[float, float]:
-    """Estimate (α̂, σ̂) for a symmetric stable distribution from empirical quantiles."""
+    """
+    Estimate (α̂, σ̂) for a symmetric stable distribution from empirical quantiles.
+
+    Args:
+        q05, q25, q75, q95: sample quantiles at 5%, 25%, 75%, 95%.
+
+    Returns:
+        alpha_hat: estimated tail index in [1.0, 2.0].
+        sigma_hat: estimated scale parameter (≥ 0).
+    """
     iqr = float(q75 - q25)
     if (not np.isfinite(iqr)) or (iqr <= 1e-12):
         return 2.0, 0.0
@@ -510,57 +689,111 @@ def estimate_alpha_sigma_mcculloch_symmetric_from_quantiles(q05, q25, q75, q95) 
     alpha_hat = float(np.interp(r_hat_clamped, R, A))
     iqr_theory = float(np.interp(r_hat_clamped, R, IQR))
     sigma_hat = float(iqr / (iqr_theory + 1e-12))
+
     return float(np.clip(alpha_hat, 1.0, 2.0)), float(max(0.0, sigma_hat))
 
 
 # ============================================================
 # ECF (Empirical Characteristic Function) estimator
 # — Koutrouvelis (1980) regression for symmetric α-stable
-# (see baselines script for detailed documentation)
+#
+# For the symmetric stable (β=0, μ=0) case, the CF is:
+#   φ(t) = exp(-σ^α |t|^α)
+#
+# Taking logs:
+#   log(-log|φ̂(t)|²) = log(2σ^α) + α·log|t|
+#
+# This is a simple linear regression Y = c + α·X where
+#   Y_k = log(-log|φ̂(t_k)|²), X_k = log|t_k|
+# and the slope directly gives α̂.
+#
+# The grid of t-values is chosen in the "informative region"
+# to avoid:
+#   - t ≈ 0  where φ ≈ 1 and log(−log(·)) is numerically unstable
+#   - t >> 1 where φ ≈ 0 and |φ̂|² is dominated by sampling noise
 # ============================================================
 
+# Minimum number of samples for a reliable α̂ estimate
 _MIN_SAMPLES_ALPHA = 500
 
 
 def _ecf_at_t(samples: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
-    """Compute |φ̂(t)|² for each t in t_grid from real-valued samples."""
+    """
+    Compute |φ̂(t)|² for each t in t_grid from real-valued samples.
+
+    For real symmetric distributions:
+        φ̂(t) = (1/n) Σ_j exp(i·t·x_j)
+        |φ̂(t)|² = [(1/n)Σ cos(t·x)]² + [(1/n)Σ sin(t·x)]²
+
+    We use chunked computation to avoid O(n_samples × n_grid) memory.
+
+    Returns: 1-D array of |φ̂(t)|² values, shape (len(t_grid),).
+    """
     n = samples.size
     if n == 0:
         return np.zeros_like(t_grid)
 
-    chunk_size = min(n, 50000)
-    total_cos = np.zeros(len(t_grid), dtype=np.float64)
-    total_sin = np.zeros(len(t_grid), dtype=np.float64)
+    phi2 = np.zeros(len(t_grid), dtype=np.float64)
+    chunk_size = min(n, 50000)  # keep memory bounded
 
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
         x_chunk = samples[start:end]
+        # outer product: (len(t_grid), chunk_size)
         tx = np.outer(t_grid, x_chunk)
-        total_cos += np.cos(tx).sum(axis=1)
-        total_sin += np.sin(tx).sum(axis=1)
+        cos_sum = np.cos(tx).sum(axis=1)
+        sin_sum = np.sin(tx).sum(axis=1)
+        if start == 0:
+            total_cos = cos_sum
+            total_sin = sin_sum
+        else:
+            total_cos += cos_sum
+            total_sin += sin_sum
 
     phi2 = (total_cos / n) ** 2 + (total_sin / n) ** 2
     return phi2
 
 
 def _choose_ecf_grid(samples: np.ndarray, n_points: int = 50) -> np.ndarray:
-    """Choose t-grid in the informative region for ECF regression."""
+    """
+    Choose a grid of t-values in the informative region for ECF regression.
+
+    Strategy: t should be in a range where |φ(t)|² is between ~0.01 and ~0.95.
+    For a symmetric stable with scale σ:
+        |φ(t)|² = exp(-2σ^α |t|^α)
+    So |φ|² ≈ 0.95 when t ≈ (0.025/σ^α)^{1/α}
+    and |φ|² ≈ 0.01 when t ≈ (2.3/σ^α)^{1/α}
+
+    We use the IQR as a robust scale estimate to set the range.
+    """
     iqr = float(np.subtract(*np.percentile(samples, [75, 25])))
     if iqr <= 1e-12:
-        iqr = float(np.std(samples)) * 1.349
+        iqr = float(np.std(samples)) * 1.349  # Gaussian IQR from std
     if iqr <= 1e-12:
         return np.linspace(0.1, 2.0, n_points)
 
+    # Rough scale: for Gaussian, IQR ≈ 1.349σ, so σ ≈ IQR/1.349
     scale_est = iqr / 1.349
+
+    # t range: from ~0.05/scale to ~3/scale (covers the informative region)
     t_lo = 0.05 / scale_est
     t_hi = 3.0 / scale_est
+
     return np.linspace(t_lo, t_hi, n_points)
 
 
 def estimate_alpha_sigma_ecf_symmetric(samples: np.ndarray) -> Tuple[float, float]:
     """
-    Estimate (α̂, σ̂) for symmetric α-stable using ECF regression
-    (Koutrouvelis 1980, simplified for β=0).
+    Estimate (α̂, σ̂) for a symmetric α-stable distribution using the ECF
+    regression method (Koutrouvelis 1980, simplified for β=0).
+
+    For SαS: log(-log|φ̂(t)|²) = log(2σ^α) + α·log|t|
+
+    The slope of the regression gives α̂; the intercept gives σ̂.
+
+    Returns:
+        alpha_hat: estimated tail index in [1.0, 2.0].
+        sigma_hat: estimated scale parameter (≥ 0).
     """
     n = samples.size
     if n < _MIN_SAMPLES_ALPHA:
@@ -569,22 +802,30 @@ def estimate_alpha_sigma_ecf_symmetric(samples: np.ndarray) -> Tuple[float, floa
     t_grid = _choose_ecf_grid(samples, n_points=50)
     phi2 = _ecf_at_t(samples, t_grid)
 
+    # Filter: keep only points where |φ̂|² is in a usable range
+    # Too close to 1 → log(-log(·)) is unstable; too close to 0 → noise-dominated
     mask = (phi2 > 0.01) & (phi2 < 0.95)
     if mask.sum() < 5:
+        # Relax bounds
         mask = (phi2 > 1e-4) & (phi2 < 0.999)
     if mask.sum() < 3:
+        # Fall back to McCulloch
         q05, q25, q75, q95 = np.quantile(samples, [0.05, 0.25, 0.75, 0.95])
         return estimate_alpha_sigma_mcculloch_symmetric_from_quantiles(q05, q25, q75, q95)
 
     t_use = t_grid[mask]
     phi2_use = phi2[mask]
 
+    # Regression: Y = log(-log(|φ̂(t)|²)),  X = log(|t|)
     Y = np.log(-np.log(phi2_use))
     X = np.log(t_use)
 
+    # Weighted least squares: points near |φ̂|² ≈ 0.5 are most informative
+    # Weight = exp(-2*(log|φ̂|² + 0.7)²)  peaks near |φ̂|² ≈ 0.5
     w = np.exp(-2.0 * (np.log(phi2_use) + 0.7) ** 2)
     w /= w.sum() + 1e-12
 
+    # WLS: α̂ = Σw·(X-X̄)(Y-Ȳ) / Σw·(X-X̄)²
     Xbar = np.average(X, weights=w)
     Ybar = np.average(Y, weights=w)
     dx = X - Xbar
@@ -592,6 +833,7 @@ def estimate_alpha_sigma_ecf_symmetric(samples: np.ndarray) -> Tuple[float, floa
     alpha_hat = float(np.sum(w * dx * dy) / (np.sum(w * dx ** 2) + 1e-12))
     intercept = Ybar - alpha_hat * Xbar
 
+    # σ̂ from intercept: log(2σ^α) = intercept → σ = (exp(intercept)/2)^{1/α}
     alpha_hat = float(np.clip(alpha_hat, 1.0, 2.0))
     sigma_hat = float((np.exp(intercept) / 2.0) ** (1.0 / alpha_hat))
 
@@ -603,13 +845,29 @@ def estimate_alpha_sigma(
     method: str = "ecf",
     n_samples_for_ecf: int = 100000,
 ) -> Tuple[float, float, bool]:
-    """Unified α̂ estimation with reliability checking."""
+    """
+    Unified interface for α̂ estimation with reliability checking.
+
+    Args:
+        samples: 1-D array of matched-statistic values (float64).
+        method: "mcculloch" or "ecf".
+        n_samples_for_ecf: subsample limit for ECF (controls speed).
+
+    Returns:
+        alpha_hat: estimated tail index in [1.0, 2.0].
+        sigma_hat: estimated scale parameter.
+        reliable: True if the estimate passes quality checks.
+    """
+    samples = np.asarray(samples, dtype=np.float64)
     n = samples.size
 
+    # ── reliability check: too few samples ──
     if n < _MIN_SAMPLES_ALPHA:
         return 2.0, 0.0, False
 
+    # ── compute estimate ──
     if method == "ecf":
+        # Subsample if very large (ECF is O(n·K))
         if n > n_samples_for_ecf:
             rng = np.random.RandomState(42)
             idx = rng.choice(n, n_samples_for_ecf, replace=False)
@@ -623,11 +881,18 @@ def estimate_alpha_sigma(
             q05, q25, q75, q95
         )
 
+    # ── reliability checks ──
     reliable = True
+
+    # Check 1: σ̂ should be positive
     if sigma_hat <= 1e-12:
         reliable = False
+
+    # Check 2: α̂ at boundary is suspicious with few samples
     if (alpha_hat <= 1.01 or alpha_hat >= 1.99) and n < 2000:
         reliable = False
+
+    # Check 3: IQR near zero → degenerate distribution
     iqr = float(np.subtract(*np.percentile(samples, [75, 25])))
     if iqr <= 1e-10:
         reliable = False
@@ -636,27 +901,40 @@ def estimate_alpha_sigma(
 
 
 def compute_snr(alpha_hat: float, sigma_hat: float, mbar_Tmean: float, Nuse: int) -> float:
-    """Compute empirical SNR(ℓ, N) = |m̄(ℓ)| · N^{1-1/α} / σ̂."""
+    """
+    Compute the empirical signal-to-noise ratio for lag detection.
+
+    SNR(ℓ, N) = |m̄(ℓ)| · N^{1 - 1/α} / σ̂
+
+    where m̄ is the absolute mean of the matched statistic (signal strength),
+    N is the number of samples, α is the tail index, and σ̂ is the scale.
+    When SNR > ε, the lag ℓ is considered detectable with N samples.
+    """
     if sigma_hat <= 1e-12:
         return 0.0
     alpha_eff = max(1.0, float(alpha_hat))
     exp = 1.0 - 1.0 / alpha_eff
-    return float(mbar_Tmean * (int(Nuse) ** exp) / float(sigma_hat))
+    return float(mbar_Tmean * (Nuse ** exp) / float(sigma_hat))
+
+
+def noise_tolerance_to_eps(noise_tolerance: float) -> float:
+    """
+    Convert a user-facing noise tolerance into the raw SNR cutoff epsilon.
+
+    The detection rule is unchanged: detect lag ell when SNR(ell, N) > eps.
+    We expose noise_tolerance = 1 / eps because it is easier to interpret:
+    noise_tolerance = 0.1 means require SNR > 10, i.e. the effective
+    noise-to-signal ratio in the detection metric must be below about 10%.
+    Smaller values are therefore stricter.
+    """
+    tol = float(noise_tolerance)
+    if not (0.0 < tol <= 1.0):
+        raise ValueError(f"--noise_tolerance must lie in (0, 1], got {tol}")
+    return float(1.0 / tol)
+
 
 def detection_error_on_prefix_arr(arr: np.ndarray, Nuse: int) -> float:
-    """
-    Coefficient of variation of the first Nuse per-sequence matched-statistic means.
-
-    This is the empirical detection error: std(ψ̄) / |mean(ψ̄)|.
-    A small value indicates the mean shift is large relative to noise.
-
-    Parameters
-    ----------
-    arr : np.ndarray
-        1-D array of per-sequence means ψ̄_n(ℓ).
-    Nuse : int
-        Number of samples (sequences) to use.
-    """
+    """Coefficient of variation of the first Nuse per-sequence means."""
     Nuse = max(1, min(int(Nuse), len(arr)))
     subset = np.asarray(arr[:Nuse], dtype=np.float64)
     if subset.size == 0:
@@ -667,12 +945,47 @@ def detection_error_on_prefix_arr(arr: np.ndarray, Nuse: int) -> float:
 
 
 # ============================================================
+# Time-scale fit from per-unit envelope μ^(q)(ℓ)
+# ============================================================
+
+def fit_exponential_tau(ells, mu_vals, min_points: int = 5):
+    """
+    Fit an exponential decay  μ(ℓ) = C · exp(-ℓ/τ)  in log-space.
+
+    Performs OLS on  log μ = a + b·ℓ  and extracts τ = -1/b.
+    Returns None if fewer than min_points have finite positive μ.
+
+    Returns:
+        dict with keys: tau, C, a, b, r2, num_points.
+    """
+    ells = np.asarray(ells, dtype=float)
+    mu_vals = np.asarray(mu_vals, dtype=float)
+    mask = np.isfinite(ells) & np.isfinite(mu_vals) & (ells > 0) & (mu_vals > 0)
+    ells = ells[mask]
+    mu_vals = mu_vals[mask]
+    if ells.size < min_points:
+        return None
+    x = ells
+    y = np.log(mu_vals)
+    A = np.vstack([x, np.ones_like(x)]).T
+    b, a = np.linalg.lstsq(A, y, rcond=None)[0]
+    y_pred = a + b * x
+    ss_res = np.sum((y - y_pred) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    tau = np.inf if b >= 0 else (-1.0 / b)
+    C = float(np.exp(a))
+    return {"tau": float(tau), "C": float(C), "a": float(a), "b": float(b), "r2": float(r2), "num_points": int(ells.size)}
+
+
+# ============================================================
 # Data generation (CPU resident)
 #
-# Identical task as the baselines script:
-#   y_t = Σ_k c_k (u^T x_{t-ℓ_k}) + ε_t
-# This ensures LSTM/GRU results are directly comparable to the
-# ConstGate/SharedGate/DiagGate baselines.
+# The task is a multi-lag linear regression in D-dimensional
+# input space:  y_t = Σ_k c_k (u^T x_{t-ℓ_k}) + ε_t
+# where u is a fixed unit direction and ε_t ~ N(0, noise_std²).
+# The difficulty is controlled by task_lags: lags well beyond
+# the model's effective memory timescale τ are unlearnable.
 # ============================================================
 
 def make_dataset_cpu(Nseq: int, T: int, D: int,
@@ -683,8 +996,20 @@ def make_dataset_cpu(Nseq: int, T: int, D: int,
     """
     Generate a synthetic multi-lag regression dataset on CPU.
 
-    Returns (X, Y, u) where X is (Nseq, T, D), Y is (Nseq, T, 1),
-    and u is the (D,) projection direction used.
+    Args:
+        Nseq:        number of independent sequences.
+        T:           sequence length (timesteps).
+        D:           input dimensionality.
+        task_lags:   list of lag values [ℓ₁, ℓ₂, ...].
+        task_coeffs: corresponding coefficients [c₁, c₂, ...].
+        noise_std:   standard deviation of observation noise ε_t.
+        u_vec:       (optional) fixed projection direction; if None,
+                     a random unit vector is drawn and returned.
+
+    Returns:
+        X: (Nseq, T, D) float32 CPU tensor of i.i.d. Gaussian inputs.
+        Y: (Nseq, T, 1) float32 CPU tensor of target outputs.
+        u: (D,) float32 numpy array, the projection direction used.
     """
     if u_vec is None:
         u = np.random.randn(D).astype(np.float32)
@@ -709,258 +1034,302 @@ def make_dataset_cpu(Nseq: int, T: int, D: int,
 
 
 # ============================================================
-# Windowing via prefix sums (batch-local)
+# Models (ConstGate, SharedGate, DiagGate)
 #
-# For GRU and LSTM the memory kernel factorises into products and
-# sums of per-step terms.  These are computed efficiently via
-# cumulative sums in log-space (for products) and direct space
-# (for first-order corrections), then sliced for each lag ℓ.
+# All three share the same recurrence structure:
+#   h_t = (1 - s_t) h_{t-1} + s_t tanh(Wx x_t + Wh h_{t-1})
+#   y_t = W_out h_t
 #
-# _prefix_log:  cumulative sum of log(x), for computing
-#               Π x[j] = exp(cs_log[t2] - cs_log[t1]).
-# _prefix_sum:  cumulative sum of x, for computing Σ x[j].
-# _win_prod_from_cs: extract ℓ-step product from prefix log.
-# _win_sum_from_cs:  extract ℓ-step sum from prefix sum.
+# They differ in how the gate s_t is parameterised:
+#   ConstGateRNN:  s_t = s (scalar buffer, non-learnable)
+#   SharedGateRNN: s_t = σ(Ws x_t + Us h_{t-1})  (scalar gate, shared across H)
+#   DiagGateRNN:   s_t = σ(Ws x_t + Us h_{t-1})  (per-unit gate, H-dimensional)
+#
+# forward_with_intermediates returns (y, hseq, diagnostics_dict):
+#   - y:     (B, T, 1) output predictions.
+#   - hseq:  (B, T, H) hidden state sequence (None if return_intermediates=False).
+#   - dict:  {"gate_s", "leak", "rdiag"} tensors for the learnability pipeline.
+#            leak_t = 1 - s_t  is the per-step retention.
+#            rdiag_t = diag(∂h_t/∂h_{t-1}) - leak_t  is the correction from
+#            the recurrent weight and gate derivative.
+#
+# Initialization notes:
+#   - Recurrent weight Wh: orthogonal init (via apply_orthogonal).
+#   - Gate weights Ws, Us: zero-initialized with _skip_orth=True so
+#     apply_orthogonal does not overwrite them.
+#   - Gate bias: set to logit(init_s) so sigmoid(bias) ≈ init_s at t=0,
+#     giving the model long initial timescales τ ≈ 1/init_s.
 # ============================================================
 
-def _prefix_log(x: torch.Tensor) -> torch.Tensor:
-    """Cumulative sum of log(x) with a leading zero, shape (B, T+1, H)."""
-    x64 = torch.clamp(x.double(), 1e-12, 1.0)
-    logx = torch.log(x64)
-    cs = torch.zeros(x.shape[0], x.shape[1] + 1, x.shape[2], dtype=torch.float64, device=x.device)
-    cs[:, 1:, :] = torch.cumsum(logx, dim=1)
-    return cs
-
-def _prefix_sum(x: torch.Tensor) -> torch.Tensor:
-    """Cumulative sum of x with a leading zero, shape (B, T+1, H)."""
-    cs = torch.zeros(x.shape[0], x.shape[1] + 1, x.shape[2], dtype=torch.float64, device=x.device)
-    cs[:, 1:, :] = torch.cumsum(x.double(), dim=1)
-    return cs
-
-def _win_prod_from_cs(cs_log: torch.Tensor, ell: int, out_dtype: torch.dtype) -> torch.Tensor:
-    """Extract ℓ-step product from prefix log-sum: Π x[t-ℓ+1..t]."""
-    B, Tp1, H = cs_log.shape
-    T = Tp1 - 1
-    if ell <= 0 or ell >= T:
-        return torch.zeros(B, 0, H, dtype=out_dtype, device=cs_log.device)
-    log_prod = cs_log[:, (ell + 1):(T + 1), :] - cs_log[:, 1:(T - ell + 1), :]
-    return torch.exp(log_prod).to(out_dtype)
-
-def _win_sum_from_cs(cs_sum: torch.Tensor, ell: int, out_dtype: torch.dtype) -> torch.Tensor:
-    """Extract ℓ-step sum from prefix cumsum: Σ x[t-ℓ+1..t]."""
-    B, Tp1, H = cs_sum.shape
-    T = Tp1 - 1
-    if ell <= 0 or ell >= T:
-        return torch.zeros(B, 0, H, dtype=out_dtype, device=cs_sum.device)
-    s = cs_sum[:, (ell + 1):(T + 1), :] - cs_sum[:, 1:(T - ell + 1), :]
-    return s.to(out_dtype)
-
-
-# ============================================================
-# Models (GRU, LSTM)
-#
-# Both models expose forward_with_intermediates(x, return_intermediates)
-# which returns (y, hseq, diagnostics_dict).
-#
-# GRU diagnostics dict: {"z", "r", "leak", "rdiag"}
-#   - z_t:     update gate (analogous to s_t in baselines).
-#   - r_t:     reset gate.
-#   - leak_t:  (1 - z_t), the per-step retention coefficient.
-#   - rdiag_t: diagonal approximation of ∂h_t/∂h_{t-1} minus leak.
-#              Captures the combined effect of z, r, and candidate
-#              gate derivatives on the recurrent Jacobian.
-#
-# LSTM diagnostics dict: {"forget", "expr", "cdiag"}
-#   - forget_t: forget gate f_t.
-#   - expr_t:   "expression" factor e_t = o_t · (1 - tanh²(c_t)),
-#               the derivative of h_t w.r.t. c_t.
-#   - cdiag_t:  diagonal approximation of ∂c_t/∂h_{t-1}, combining
-#               forget, input, and candidate gate derivatives.
-#
-# When return_intermediates=False, the model only computes y (no
-# stacking of diagnostic tensors), saving memory during training.
-# ============================================================
-
-class BaseSeqModel(nn.Module):
+class BaseRNN(nn.Module):
     """Base class providing orthogonal init with _skip_orth support."""
 
     def __init__(self):
         super().__init__()
 
-    def forward(self, x: torch.Tensor):
-        return self.forward_with_intermediates(x)
+    def forward(self, x: torch.Tensor, gate_rescale=None):
+        return self.forward_with_intermediates(x, gate_rescale=gate_rescale)
 
     def apply_orthogonal(self):
         """Orthogonal init for all Linear layers except those flagged _skip_orth."""
         for m in self.modules():
             if isinstance(m, nn.Linear) and m.weight is not None and m.weight.ndim == 2:
                 if getattr(m, '_skip_orth', False):
-                    continue  # preserve deliberate init on gate layers
+                    continue  # preserve deliberate zero/bias init on gate layers
                 nn.init.orthogonal_(m.weight)
 
-class GRUModel(BaseSeqModel):
-    """
-    GRU with explicit diagonal Jacobian intermediates.
+    def get_const_gate_s(self):
+        """Return fixed gate value s if applicable (ConstGateRNN only)."""
+        return None
 
-    Recurrence:
-      z_t = σ(Wz x_t + Uz h_{t-1})           (update gate)
-      r_t = σ(Wr x_t + Ur h_{t-1})           (reset gate)
-      g_t = tanh(Wh x_t + Uh (r_t ⊙ h_{t-1})) (candidate)
-      h_t = (1 - z_t) h_{t-1} + z_t g_t
 
-    The diagonal rdiag approximation is:
-      rdiag_t ≈ (g - h_prev) z'·diag(Uz) + z·g'·diag(Uh)·(r + h_prev·r'·diag(Ur))
+class ConstGateRNN(BaseRNN):
     """
-    def __init__(self, D: int, H: int, ln: bool = False):
+    Gated RNN with a fixed (non-learnable) scalar gate s.
+
+    The gate is a registered buffer, so it is not updated by the optimizer.
+    This model serves as the theoretical baseline: its memory timescale
+    τ = -1/log(1-s) is known in closed form.
+    """
+    def __init__(self, D: int, H: int, s: float = 0.7, ln: bool = False):
         super().__init__()
         self.D, self.H = D, H
-        self.Wz, self.Uz = nn.Linear(D, H), nn.Linear(H, H, bias=False)
-        self.Wr, self.Ur = nn.Linear(D, H), nn.Linear(H, H, bias=False)
-        self.Wh, self.Uh = nn.Linear(D, H), nn.Linear(H, H, bias=False)
-        self.ln_h = layernorm_if(ln, H)
+        self.Wx = nn.Linear(D, H)
+        self.Wh = nn.Linear(H, H, bias=False)
+        self.ln = layernorm_if(ln, H)
         self.out = nn.Linear(H, 1)
+
+        s = float(np.clip(s, 1e-6, 1.0 - 1e-6))
+        self.register_buffer("s_const", torch.tensor(s, dtype=torch.float32))
+
+        nn.init.zeros_(self.Wx.bias)
         nn.init.zeros_(self.out.bias)
 
-    def forward_with_intermediates(self, x: torch.Tensor, return_intermediates=True):
+    def get_const_gate_s(self):
+        return float(self.s_const.item())
+
+    def forward_with_intermediates(self, x: torch.Tensor, gate_rescale=None, return_intermediates=True):
         B, T, _ = x.shape
         h = torch.zeros(B, self.H, device=x.device)
 
+        s = self.s_const
+        if gate_rescale is not None:
+            s = torch.clamp(s * gate_rescale, 0.0, 1.0)
+
         if return_intermediates:
-            uz_diag = torch.diagonal(self.Uz.weight)
-            ur_diag = torch.diagonal(self.Ur.weight)
-            uh_diag = torch.diagonal(self.Uh.weight)
+            wh_diag = torch.diagonal(self.Wh.weight, 0)
 
         ys = []
         if return_intermediates:
-            hs = []
-            z_list, r_list, leak_list, rdiag_list = [], [], [], []
+            gates_s, leaks, rdiags, hs = [], [], [], []
 
         for t in range(T):
             h_prev = h
-            z = torch.sigmoid(self.Wz(x[:, t]) + self.Uz(h_prev))
-            r = torch.sigmoid(self.Wr(x[:, t]) + self.Ur(h_prev))
-            g = torch.tanh(self.ln_h(self.Wh(x[:, t]) + self.Uh(r * h_prev)))
-
-            h = (1 - z) * h_prev + z * g
+            pre = self.Wx(x[:, t]) + self.Wh(h_prev)
+            pre = self.ln(pre)
+            h_tilde = torch.tanh(pre)
+            h = (1 - s) * h_prev + s * h_tilde
             y = self.out(h)
             ys.append(y)
 
             if return_intermediates:
-                zprime = z * (1 - z)
-                rprime = r * (1 - r)
-                gprime = 1.0 - g**2
-                rdiag = (g - h_prev) * zprime * uz_diag + z * gprime * uh_diag * (r + h_prev * rprime * ur_diag)
+                sH = s.expand(B, self.H)
+                leak = 1 - sH
+                tanh_prime = 1.0 - h_tilde**2
+                rdiag = (sH * tanh_prime) * wh_diag.view(1, -1)
 
                 hs.append(h)
-                z_list.append(z)
-                r_list.append(r)
-                leak_list.append(1 - z)
-                rdiag_list.append(rdiag)
+                gates_s.append(sH)
+                leaks.append(leak)
+                rdiags.append(rdiag)
 
-        y_out = torch.stack(ys, dim=1)
+        y = torch.stack(ys, dim=1)
         if not return_intermediates:
-            return y_out, None, None
-        return (
-            y_out,
-            torch.stack(hs, dim=1),
-            {
-                "z": torch.stack(z_list, dim=1),
-                "r": torch.stack(r_list, dim=1),
-                "leak": torch.stack(leak_list, dim=1),
-                "rdiag": torch.stack(rdiag_list, dim=1),
-            },
-        )
+            return y, None, None
+        hseq = torch.stack(hs, dim=1)
+        gate_s = torch.stack(gates_s, dim=1)
+        leak = torch.stack(leaks, dim=1)
+        rdiag = torch.stack(rdiags, dim=1)
+        return y, hseq, {"gate_s": gate_s, "leak": leak, "rdiag": rdiag}
 
-class LSTMModel(BaseSeqModel):
+
+class SharedGateRNN(BaseRNN):
     """
-    LSTM with explicit diagonal Jacobian intermediates.
+    Gated RNN with a learnable scalar gate shared across all H units.
 
-    Recurrence:
-      i_t = σ(Wi x_t + Ui h_{t-1})           (input gate)
-      f_t = σ(Wf x_t + Uf h_{t-1})           (forget gate)
-      o_t = σ(Wo x_t + Uo h_{t-1})           (output gate)
-      g_t = tanh(Wg x_t + Ug h_{t-1})        (candidate)
-      c_t = f_t c_{t-1} + i_t g_t
-      h_t = o_t tanh(c_t)
-
-    Diagnostics:
-      expr_t = o_t (1 - tanh²(c_t))     — derivative ∂h_t/∂c_t.
-      cdiag_t ≈ c_{t-1}·f'·diag(Uf) + i·g'·diag(Ug) + g·i'·diag(Ui)
-              — diagonal approximation of ∂c_t/∂h_{t-1}.
+    Gate: s_t = σ(Ws x_t + Us h_{t-1}) ∈ ℝ¹, broadcast to all H units.
+    At initialization, gate weights are zero and bias = logit(init_s),
+    so the gate starts near init_s and the model has long memory.
     """
-    def __init__(self, D: int, H: int, ln: bool = False):
+    def __init__(self, D: int, H: int, ln: bool = False, init_s: float = 0.005):
         super().__init__()
         self.D, self.H = D, H
-        self.Wi, self.Ui = nn.Linear(D, H), nn.Linear(H, H, bias=False)
-        self.Wf, self.Uf = nn.Linear(D, H), nn.Linear(H, H, bias=False)
-        self.Wo, self.Uo = nn.Linear(D, H), nn.Linear(H, H, bias=False)
-        self.Wg, self.Ug = nn.Linear(D, H), nn.Linear(H, H, bias=False)
-        self.ln_cand = layernorm_if(ln, H)
-        self.out = nn.Linear(H, 1)
-        nn.init.zeros_(self.out.bias)
+        self.Wx = nn.Linear(D, H)
+        self.Wh = nn.Linear(H, H, bias=False)
+        self.ln_h = layernorm_if(ln, H)
 
-    def forward_with_intermediates(self, x: torch.Tensor, return_intermediates=True):
+        self.Ws = nn.Linear(D, 1, bias=True)
+        self.Us = nn.Linear(H, 1, bias=False)
+        self.Ws._skip_orth = True   # gate layers: preserve zero-init on weights
+        self.Us._skip_orth = True
+
+        self.out = nn.Linear(H, 1)
+
+        nn.init.zeros_(self.Wx.bias)
+        nn.init.zeros_(self.out.bias)
+        nn.init.zeros_(self.Ws.weight)
+        nn.init.zeros_(self.Us.weight)
+
+        # Gate bias -> logit(init_s) so sigmoid(bias) = init_s at t=0.
+        init_s = float(np.clip(init_s, 1e-6, 1.0 - 1e-6))
+        gate_bias = float(np.log(init_s / (1.0 - init_s)))
+        nn.init.constant_(self.Ws.bias, gate_bias)
+
+    def forward_with_intermediates(self, x: torch.Tensor, gate_rescale=None, return_intermediates=True):
         B, T, _ = x.shape
         h = torch.zeros(B, self.H, device=x.device)
-        c = torch.zeros(B, self.H, device=x.device)
 
         if return_intermediates:
-            uf_diag = torch.diagonal(self.Uf.weight)
-            ui_diag = torch.diagonal(self.Ui.weight)
-            ug_diag = torch.diagonal(self.Ug.weight)
+            wh_diag = torch.diagonal(self.Wh.weight, 0)
+            us_vec = self.Us.weight.view(-1)
 
         ys = []
         if return_intermediates:
-            hs = []
-            f_list, e_list, cdiag_list = [], [], []
+            gates_s, leaks, rdiags, hs = [], [], [], []
 
         for t in range(T):
-            h_prev, c_prev = h, c
+            h_prev = h
+            a_s = self.Ws(x[:, t]) + self.Us(h_prev)
+            s = torch.sigmoid(a_s)
+            if gate_rescale is not None:
+                s = torch.clamp(s * gate_rescale, 0.0, 1.0)
 
-            i = torch.sigmoid(self.Wi(x[:, t]) + self.Ui(h_prev))
-            f = torch.sigmoid(self.Wf(x[:, t]) + self.Uf(h_prev))
-            o = torch.sigmoid(self.Wo(x[:, t]) + self.Uo(h_prev))
-            g = torch.tanh(self.ln_cand(self.Wg(x[:, t]) + self.Ug(h_prev)))
+            pre = self.Wx(x[:, t]) + self.Wh(h_prev)
+            pre = self.ln_h(pre)
+            h_tilde = torch.tanh(pre)
 
-            c = f * c_prev + i * g
-            tanh_c = torch.tanh(c)
-            h = o * tanh_c
+            sH = s.expand(B, self.H)
+            h = (1 - sH) * h_prev + sH * h_tilde
             y = self.out(h)
             ys.append(y)
 
             if return_intermediates:
-                e = o * (1.0 - tanh_c**2)
+                leak = 1 - sH
+                tanh_prime = 1.0 - h_tilde**2
+                s_prime = (s * (1 - s)).expand(B, self.H)
 
-                term_f = c_prev * (f * (1 - f)) * uf_diag
-                term_g = i * (1 - g**2) * ug_diag
-                term_i = g * (i * (1 - i)) * ui_diag
-                cdiag = term_f + term_g + term_i
+                rdiag_gate = (h_tilde - h_prev) * (s_prime * us_vec.view(1, -1))
+                rdiag_rec  = (sH * tanh_prime) * wh_diag.view(1, -1)
+                rdiag = rdiag_gate + rdiag_rec
 
                 hs.append(h)
-                f_list.append(f)
-                e_list.append(e)
-                cdiag_list.append(cdiag)
+                gates_s.append(sH)
+                leaks.append(leak)
+                rdiags.append(rdiag)
 
-        y_out = torch.stack(ys, dim=1)
+        y = torch.stack(ys, dim=1)
         if not return_intermediates:
-            return y_out, None, None
-        return (
-            y_out,
-            torch.stack(hs, dim=1),
-            {
-                "forget": torch.stack(f_list, dim=1),
-                "expr": torch.stack(e_list, dim=1),
-                "cdiag": torch.stack(cdiag_list, dim=1),
-            },
-        )
+            return y, None, None
+        hseq = torch.stack(hs, dim=1)
+        gate_s = torch.stack(gates_s, dim=1)
+        leak = torch.stack(leaks, dim=1)
+        rdiag = torch.stack(rdiags, dim=1)
+        return y, hseq, {"gate_s": gate_s, "leak": leak, "rdiag": rdiag}
 
-def build_model(name: str, D: int, H: int, ln: bool) -> BaseSeqModel:
-    """Instantiate a GRU or LSTM model by name."""
-    name = name.lower().strip()
-    if name == "gru":
-        return GRUModel(D, H, ln=ln)
-    if name == "lstm":
-        return LSTMModel(D, H, ln=ln)
+
+class DiagGateRNN(BaseRNN):
+    """
+    Gated RNN with a learnable per-unit (diagonal) gate.
+
+    Gate: s_t = σ(Ws x_t + Us h_{t-1}) ∈ ℝᴴ, one gate per hidden unit.
+    Each unit can learn its own timescale independently.
+    Initialization is identical to SharedGateRNN (zero weights, biased gate).
+    """
+    def __init__(self, D: int, H: int, ln: bool = False, init_s: float = 0.005):
+        super().__init__()
+        self.D, self.H = D, H
+        self.Wx = nn.Linear(D, H)
+        self.Wh = nn.Linear(H, H, bias=False)
+        self.ln_h = layernorm_if(ln, H)
+
+        self.Ws = nn.Linear(D, H, bias=True)
+        self.Us = nn.Linear(H, H, bias=False)
+        self.Ws._skip_orth = True   # gate layers: preserve zero-init on weights
+        self.Us._skip_orth = True
+
+        self.out = nn.Linear(H, 1)
+
+        nn.init.zeros_(self.Wx.bias)
+        nn.init.zeros_(self.out.bias)
+        nn.init.zeros_(self.Ws.weight)
+        nn.init.zeros_(self.Us.weight)
+
+        # Gate bias -> logit(init_s) so sigmoid(bias) = init_s at t=0.
+        init_s = float(np.clip(init_s, 1e-6, 1.0 - 1e-6))
+        gate_bias = float(np.log(init_s / (1.0 - init_s)))
+        nn.init.constant_(self.Ws.bias, gate_bias)
+
+    def forward_with_intermediates(self, x: torch.Tensor, gate_rescale=None, return_intermediates=True):
+        B, T, _ = x.shape
+        h = torch.zeros(B, self.H, device=x.device)
+
+        if return_intermediates:
+            wh_diag = torch.diagonal(self.Wh.weight, 0)
+            us_diag = torch.diagonal(self.Us.weight, 0)
+
+        ys = []
+        if return_intermediates:
+            gates_s, leaks, rdiags, hs = [], [], [], []
+
+        for t in range(T):
+            h_prev = h
+            a_s = self.Ws(x[:, t]) + self.Us(h_prev)
+            s = torch.sigmoid(a_s)
+            if gate_rescale is not None:
+                s = torch.clamp(s * gate_rescale, 0.0, 1.0)
+
+            pre = self.Wx(x[:, t]) + self.Wh(h_prev)
+            pre = self.ln_h(pre)
+            h_tilde = torch.tanh(pre)
+
+            h = (1 - s) * h_prev + s * h_tilde
+            y = self.out(h)
+            ys.append(y)
+
+            if return_intermediates:
+                leak = 1 - s
+                tanh_prime = 1.0 - h_tilde**2
+                s_prime = s * (1 - s)
+
+                rdiag_gate = (h_tilde - h_prev) * (s_prime * us_diag.view(1, -1))
+                rdiag_rec  = (s * tanh_prime) * wh_diag.view(1, -1)
+                rdiag = rdiag_gate + rdiag_rec
+
+                hs.append(h)
+                gates_s.append(s)
+                leaks.append(leak)
+                rdiags.append(rdiag)
+
+        y = torch.stack(ys, dim=1)
+        if not return_intermediates:
+            return y, None, None
+        hseq = torch.stack(hs, dim=1)
+        gate_s = torch.stack(gates_s, dim=1)
+        leak = torch.stack(leaks, dim=1)
+        rdiag = torch.stack(rdiags, dim=1)
+        return y, hseq, {"gate_s": gate_s, "leak": leak, "rdiag": rdiag}
+
+
+def build_model(name: str, D: int, H: int, const_s: float, ln: bool) -> BaseRNN:
+    """Instantiate a baseline model by name. const_s is used as both the
+    ConstGateRNN's fixed gate value and SharedGate/DiagGate's initial gate value."""
+    name = name.lower()
+    if name == "const":
+        return ConstGateRNN(D, H, s=const_s, ln=ln)
+    if name == "shared":
+        return SharedGateRNN(D, H, ln=ln, init_s=const_s)
+    if name in ["diag", "multigate"]:
+        return DiagGateRNN(D, H, ln=ln, init_s=const_s)
     raise ValueError(f"Unknown model {name}")
 
 
@@ -976,19 +1345,17 @@ def build_model(name: str, D: int, H: int, ln: bool) -> BaseSeqModel:
 # every epoch using the same task direction u_vec.
 # ============================================================
 
-def train_model(args, model: nn.Module,
+def train_model(args, model: BaseRNN,
                 Xtr_cpu: torch.Tensor, Ytr_cpu: torch.Tensor,
                 outdir: str, model_name: str, device: torch.device,
-                u_vec: Optional[np.ndarray]) -> None:
+                u_vec: Optional[np.ndarray] = None):
     """
-    Train a GRU/LSTM model with streaming mini-batches (CPU→GPU).
+    Train a baseline RNN model with streaming mini-batches.
 
     Writes <outdir>/<model_name>_learning_curve.csv with columns:
         epoch, train_loss, train_acc (R²), val_loss, val_acc (R²).
     Optionally logs periodic gate statistics to gate_stats_<model>.csv.
     Halts early if NaN/Inf loss is detected.
-
-    Returns the optimizer (needed for extracting adaptive base rates).
     """
     if args.optimizer == "adamw":
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -1095,27 +1462,18 @@ def train_model(args, model: nn.Module,
             log(f"[train:{model_name}] epoch {ep+1}/{args.epochs} avg_loss={train_loss_epoch:.4g} "
                 f"train_R2={tr_r2_eval:.3f} val_R2={va_r2:.3f}")
 
-        # optional gate stats logging (kept compatible)
-        if args.log_gate_stats and ((ep % args.gate_log_every) == 0):
+        if args.log_gate_stats and (ep % args.gate_log_every) == 0:
             with torch.no_grad():
                 idx0 = perm[:min(Btot, bs)]
                 xb0 = Xtr_cpu[idx0].to(device, non_blocking=True)
                 _, _, gdbg = model.forward_with_intermediates(xb0)
                 rows = []
-                if model_name == "gru":
-                    rows.extend([
-                        ("z_mean", float(gdbg["z"].mean().item())),
-                        ("r_mean", float(gdbg["r"].mean().item())),
-                        ("leak_mean", float(gdbg["leak"].mean().item())),
-                        ("rdiag_mean", float(gdbg["rdiag"].mean().item())),
-                    ])
-                elif model_name == "lstm":
-                    rows.extend([
-                        ("forget_mean", float(gdbg["forget"].mean().item())),
-                        ("expr_mean", float(gdbg["expr"].mean().item())),
-                        ("cdiag_mean", float(gdbg["cdiag"].mean().item())),
-                    ])
-
+                if "gate_s" in gdbg:
+                    rows.append(("gate_s_mean", float(gdbg["gate_s"].mean().item())))
+                if "leak" in gdbg:
+                    rows.append(("leak_mean", float(gdbg["leak"].mean().item())))
+                if "rdiag" in gdbg:
+                    rows.append(("rdiag_mean", float(gdbg["rdiag"].mean().item())))
                 gpath = os.path.join(outdir, f"gate_stats_{model_name}.csv")
                 write_header = not os.path.exists(gpath)
                 with open(gpath, "a", newline="") as gf:
@@ -1124,7 +1482,6 @@ def train_model(args, model: nn.Module,
                         w.writerow(["epoch", "metric", "value"])
                     for k, v in rows:
                         w.writerow([ep, k, v])
-
                 del xb0, gdbg
 
     if nan_halt:
@@ -1134,187 +1491,26 @@ def train_model(args, model: nn.Module,
 
 
 # ============================================================
-# Per-batch prefix objects for μ windows (architecture-specific)
-#
-# The memory kernel μ^(q)(ℓ) requires ℓ-step products and sums of
-# per-step diagonal terms.  We pre-compute cumulative arrays once
-# per batch, then slice them for each lag ℓ in the diagnostic grid.
-#
-# GRU:  μ ≈ Π(1-z) + first-order correction via rdiag/(1-z)
-#       We also track the reset gate r for potential future use.
-# LSTM: μ ≈ Π f + first-order correction via cdiag·e_{t-1}/f_t
-#       where e = o·(1-tanh²(c)) is the "expression" factor.
+# Per-model diagnostics
 # ============================================================
 
-def precompute_prefixes_gru(leak: torch.Tensor, reset: torch.Tensor, rdiag: torch.Tensor):
-    """
-    Build prefix arrays for GRU memory-kernel windows.
-
-    Args:
-        leak:  (B, T, H) retention coefficients (1 - z_t).
-        reset: (B, T, H) reset gate r_t values.
-        rdiag: (B, T, H) diagonal correction term.
-
-    Returns:
-        cs_log_leak:  prefix log-sum of leak (for ℓ-step product).
-        cs_log_reset: prefix log-sum of reset (tracked for diagnostics).
-        cs_log_eta:   prefix log-sum of leak*reset (composite kernel).
-        cs_ratio:     prefix sum of rdiag/leak (first-order correction).
-    """
-    with torch.no_grad():
-        leak64 = torch.clamp(leak.double(), 1e-12, 1.0)
-        cs_log_leak = _prefix_log(leak)
-        cs_log_reset = _prefix_log(torch.clamp(reset, 1e-12, 1.0))
-        cs_log_eta = _prefix_log(torch.clamp(leak * reset, 1e-12, 1.0))
-
-        ratio = (rdiag.double() / leak64).to(torch.float64)
-        cs_ratio = _prefix_sum(ratio)
-
-    return cs_log_leak, cs_log_reset, cs_log_eta, cs_ratio
-
-def precompute_prefixes_lstm(forget: torch.Tensor, expr: torch.Tensor, cdiag: torch.Tensor):
-    """
-    Build prefix arrays for LSTM memory-kernel windows.
-
-    For LSTM the cell-state kernel is  Π f_j  (product of forget gates),
-    and the first-order correction involves  cdiag · e_{t-1} / f_t  where
-    e = o·(1-tanh²(c)) maps cell-state perturbations back to hidden state.
-
-    Args:
-        forget: (B, T, H) forget gate f_t values.
-        expr:   (B, T, H) expression factor e_t = o_t · (1 - tanh²(c_t)).
-        cdiag:  (B, T, H) diagonal approximation of ∂c_t/∂h_{t-1}.
-
-    Returns:
-        cs_log_f: prefix log-sum of forget (for ℓ-step product).
-        cs_ratio: prefix sum of cdiag·e_{t-1}/f_t (first-order correction).
-    """
-    with torch.no_grad():
-        cs_log_f = _prefix_log(torch.clamp(forget, 1e-12, 1.0))
-
-        # Shift expr by one timestep: e_{t-1} is needed at step t.
-        e_shift = torch.zeros_like(expr)
-        e_shift[:, 1:, :] = expr[:, :-1, :]
-        f64 = torch.clamp(forget.double(), 1e-12, 1.0)
-        ratio = (cdiag.double() * e_shift.double() / f64).to(torch.float64)
-        cs_ratio = _prefix_sum(ratio)
-
-    return cs_log_f, cs_ratio
-
-
-# ============================================================
-# Fit utilities
-#
-# These post-process the per-lag envelope and matched-statistic
-# results into summary quantities used by the paper's figures:
-#   - fit_exponential_tau: per-unit τ from |μ^(q)(ℓ)| decay
-#   - fit_envelope_regimes: exponential vs power-law fit to f̂(ℓ)
-#   - compute_H_N: learnability window H_N from N_required
-# ============================================================
-
-def fit_exponential_tau(ells, mu_vals, min_points: int = 5):
-    """
-    Fit exponential decay  μ(ℓ) = C · exp(-ℓ/τ)  in log-space.
-
-    OLS on  log μ = a + b·ℓ  with τ = -1/b.
-    Returns None if fewer than min_points have finite positive μ.
-    """
-    ells = np.asarray(ells, dtype=float)
-    mu_vals = np.asarray(mu_vals, dtype=float)
-    mask = np.isfinite(ells) & np.isfinite(mu_vals) & (ells > 0) & (mu_vals > 0)
-    ells, mu_vals = ells[mask], mu_vals[mask]
-    if ells.size < min_points:
-        return None
-    x, y = ells, np.log(mu_vals)
-    A = np.vstack([x, np.ones_like(x)]).T
-    b, a = np.linalg.lstsq(A, y, rcond=None)[0]
-    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
-    ss_res = float(np.sum((y - (a + b * x)) ** 2))
-    r2 = 1.0 - ss_res / (ss_tot + 1e-12) if ss_tot > 0 else float("nan")
-    return {
-        "tau": float(np.inf if b >= 0 else (-1.0 / b)),
-        "C": float(np.exp(a)),
-        "a": float(a),
-        "b": float(b),
-        "r2": float(r2),
-        "num_points": int(ells.size),
-    }
-
-def fit_envelope_regimes(ells: np.ndarray, mu_vals: np.ndarray, log_mu_vals: np.ndarray) -> Dict:
-    """
-    Fit exponential and power-law models to the envelope f̂(ℓ).
-
-    Exponential: log f̂(ℓ) = a + b·ℓ  →  τ_env = -1/b.
-    Power-law:   log f̂(ℓ) = c + d·log(ℓ).
-
-    Returns dict with sub-dicts "exp" and "power", each with
-    fit coefficients and R² values.
-    """
-    mask = np.isfinite(log_mu_vals)
-    ells_fit, log_mu_fit = ells[mask], log_mu_vals[mask]
-    if ells_fit.size < 3:
-        return {}
-
-    ss_tot = float(np.sum((log_mu_fit - log_mu_fit.mean()) ** 2) + 1e-12)
-
-    A_exp = np.vstack([np.ones_like(ells_fit), ells_fit]).T
-    coeff_exp, _, _, _ = np.linalg.lstsq(A_exp, log_mu_fit, rcond=None)
-    pred_exp = A_exp @ coeff_exp
-    ss_res_exp = float(np.sum((log_mu_fit - pred_exp) ** 2))
-    r2_exp = 1.0 - ss_res_exp / ss_tot
-    b_exp = float(coeff_exp[1])
-
-    log_ell = np.log(ells_fit.astype(float) + 1e-8)
-    A_pow = np.vstack([np.ones_like(log_ell), log_ell]).T
-    coeff_pow, _, _, _ = np.linalg.lstsq(A_pow, log_mu_fit, rcond=None)
-    pred_pow = A_pow @ coeff_pow
-    ss_res_pow = float(np.sum((log_mu_fit - pred_pow) ** 2))
-    r2_pow = 1.0 - ss_res_pow / ss_tot
-
-    return {
-        "exp": {
-            "a": float(coeff_exp[0]),
-            "b": b_exp,
-            "r2": float(r2_exp),
-            "tau_env": float(-1.0 / b_exp) if b_exp < 0 else float("inf"),
-        },
-        "power": {
-            "c": float(coeff_pow[0]),
-            "d": float(coeff_pow[1]),
-            "r2": float(r2_pow),
-        },
-    }
-
-def compute_H_N(ells: List[int], Nreq_by_ell: Dict[int, int], N_values: List[int]) -> Dict[int, int]:
-    """
-    Compute the learnability window H_N for each training budget N.
-
-    H_N = max{ℓ : N_required(ℓ) ≤ N}, i.e. the longest lag detectable
-    with N samples.  Returns {N: H_N} dict.
-    """
-    H_by_N: Dict[int, int] = {}
-    for N in N_values:
-        valid = [ell for ell in ells if Nreq_by_ell.get(int(ell), -1) != -1 and Nreq_by_ell[int(ell)] <= N]
-        H_by_N[int(N)] = int(max(valid)) if valid else 0
-    return H_by_N
-
-
-# ============================================================
-# Diagnostics pipeline
-# ============================================================
-
-def run_for_model(args, model_name: str, mdir: str,
+def run_for_model(args, model_name: str, outdir: str,
                   Xtr_cpu: torch.Tensor, Ytr_cpu: torch.Tensor,
                   Xdg_cpu: torch.Tensor, Ydg_cpu: torch.Tensor,
                   device: torch.device,
-                  u_vec: Optional[np.ndarray]) -> Dict:
-    """Train one model and run the learnability diagnostics."""
-    model = build_model(model_name, args.D, args.H, ln=args.layernorm).to(device)
+                  u_vec: Optional[np.ndarray] = None) -> Dict:
+    """
+    Train one model and run the full learnability diagnostic pipeline.
 
-    log(f"[run:{model_name}] train start")
-    t_train0 = now_s()
-    opt, nan_halt = train_model(args, model, Xtr_cpu, Ytr_cpu, mdir, model_name, device=device, u_vec=u_vec)
-    log(f"[run:{model_name}] train done  dt={now_s()-t_train0:.1f}s")
+    Returns a dict with per-lag results: envelope values, tail indices,
+    N_required, alpha/sigma estimates, and per-unit τ fits.
+    """
+    model = build_model(model_name, args.D, args.H, const_s=args.const_s, ln=args.layernorm).to(device)
+
+    opt, nan_halt = train_model(args, model, Xtr_cpu, Ytr_cpu, outdir, model_name, device=device, u_vec=u_vec)
+
+    model.eval()
+    os.makedirs(outdir, exist_ok=True)
 
     if nan_halt:
         log(f"[diag:{model_name}] WARNING: training diverged (NaN halt). "
@@ -1331,11 +1527,12 @@ def run_for_model(args, model_name: str, mdir: str,
     #   Lambda_q_rowmean (H,): row mean of lambda_matrix — the
     #       LN-approximated, lag-independent base rate (for comparison).
     # ------------------------------------------------------------------
+    mdir = outdir
     lambda_matrix, Lambda_q_rowmean = extract_adaptive_rate_matrix(model, opt, lr=args.lr)
     use_lag_dependent = (lambda_matrix is not None)
 
     # Fallback for SGD or corrupted state: uniform lr
-    Lambda_q_fallback = torch.tensor(Lambda_q_rowmean, dtype=torch.float32, device=device)  # (H,)
+    Lambda_q_fallback = torch.tensor(Lambda_q_rowmean, dtype=torch.float64, device=device)  # (H,)
     if use_lag_dependent:
         lambda_matrix = lambda_matrix.to(device)
         log(f"[diag:{model_name}] using LAG-DEPENDENT Rayleigh-quotient base rates "
@@ -1344,50 +1541,49 @@ def run_for_model(args, model_name: str, mdir: str,
         log(f"[diag:{model_name}] using UNIFORM base rate lr={args.lr:.4e} (SGD or no second-moment state)")
 
     # Save LN-approximated (row-mean) base rates to CSV for comparison
-    Lambda_q_path = os.path.join(mdir, f"{model_name}_adaptive_base_rates.csv")
-    with open(Lambda_q_path, "w", newline="") as f:
+    lambda_path = os.path.join(mdir, f"{model_name}_adaptive_base_rates.csv")
+    with open(lambda_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["neuron_q", "Lambda_q"])
         for q_idx in range(len(Lambda_q_rowmean)):
             w.writerow([q_idx, float(Lambda_q_rowmean[q_idx])])
 
-    del opt  # free optimizer memory
-
-    model.eval()
-
     ells = np.linspace(args.lag_min, args.lag_max, args.num_lags, dtype=int)
     ells_list = [int(e) for e in ells]
 
     Bdg, Tdg, _ = Xdg_cpu.shape
-    Hdim = int(args.H)
+    H = int(args.H)
 
     # Per-sequence matched-statistic means ψ̄_n(ℓ).
     psi_seq_lists: Dict[int, list] = {ell: [] for ell in ells_list}
 
+    # envelope accumulators
     sum_mass: Dict[int, float] = {ell: 0.0 for ell in ells_list}
     sum_log_mass: Dict[int, float] = {ell: 0.0 for ell in ells_list}
     count_seq: Dict[int, int] = {ell: 0 for ell in ells_list}
-    sum_unit: Dict[int, np.ndarray] = {ell: np.zeros(Hdim, dtype=np.float64) for ell in ells_list}
+    sum_unit: Dict[int, np.ndarray] = {ell: np.zeros(H, dtype=np.float64) for ell in ells_list}
+    sum_unit_zero_order: Dict[int, np.ndarray] = {ell: np.zeros(H, dtype=np.float64) for ell in ells_list}
+    sum_unit_first_order: Dict[int, np.ndarray] = {ell: np.zeros(H, dtype=np.float64) for ell in ells_list}
 
     # Envelope decomposition terms.
     sum_mass_gates: Dict[int, float] = {ell: 0.0 for ell in ells_list}
-    sum_unit_gates: Dict[int, np.ndarray] = {ell: np.zeros(Hdim, dtype=np.float64) for ell in ells_list}
+    sum_unit_gates: Dict[int, np.ndarray] = {ell: np.zeros(H, dtype=np.float64) for ell in ells_list}
 
     # Lag-dependent base rate statistics: track per-lag Λ^(q)_{r,ℓ} distribution
     sum_lambda_mean: Dict[int, float] = {ell: 0.0 for ell in ells_list}
     sum_lambda_sq: Dict[int, float] = {ell: 0.0 for ell in ells_list}
     count_lambda: Dict[int, int] = {ell: 0 for ell in ells_list}
 
+    # batching for diagnostics
+    Bb = min(128, int(Bdg))
+    nb = int(math.ceil(Bdg / Bb))
+    stepB = max(1, nb // 10)
+
+    log(f"[diag:{model_name}] start: Bdg={Bdg} T={Tdg} H={H} num_lags={len(ells_list)} Bb={Bb} nb={nb}")
+    log(f"[diag:{model_name}] orient_matched_statistic_sign={int(bool(args.orient_matched_statistic_sign))}")
+    log(f"[diag:{model_name}] per-sequence means: {Bdg} sequences per lag")
+
     try:
-        log(f"[run:{model_name}] diag stream start: Bdg={Bdg} T={Tdg} H={Hdim} num_lags={len(ells_list)}")
-        log(f"[diag:{model_name}] orient_matched_statistic_sign={int(bool(args.orient_matched_statistic_sign))}")
-        log(f"[diag:{model_name}] per-sequence means: {Bdg} sequences per lag")
-        t_diag0 = now_s()
-
-        Bb = min(int(args.diag_batch_size), int(Bdg))
-        nb = int(math.ceil(Bdg / Bb))
-        stepB = max(1, nb // 10)
-
         Wout = model.out.weight.detach()  # (1,H) on GPU
 
         for bi in range(nb):
@@ -1402,124 +1598,126 @@ def run_for_model(args, model_name: str, mdir: str,
 
             with torch.no_grad():
                 yhat, hseq, g = model.forward_with_intermediates(xb)
+                leak = g["leak"]
+                rdiag = g["rdiag"]
+
+            # sanity checks (cheap, catches silent mismatches)
+            assert leak.shape == rdiag.shape, (leak.shape, rdiag.shape)
+            assert leak.shape[:2] == yb.shape[:2], (leak.shape, yb.shape)
 
             vseq = compute_vseq_jvp(model, xb, w_seed=args.w_seed).detach()
+            assert vseq.shape == leak.shape, (vseq.shape, leak.shape)
 
             with torch.no_grad():
-                err = (yhat[..., 0] - yb[..., 0])  # (Bb,T)
-                delta = err.unsqueeze(-1) * Wout   # (Bb,T,H)
+                err = (yhat[..., 0] - yb[..., 0])
+                delta = err.unsqueeze(-1) * Wout  # (Bb,T,H)
 
-            with torch.no_grad():
-                if model_name == "gru":
-                    leak = g["leak"]
-                    reset = g["r"]
-                    rdiag = g["rdiag"]
-                    cs_log_leak, cs_log_reset, cs_log_eta, cs_ratio = precompute_prefixes_gru(leak, reset, rdiag)
-                else:
-                    forget = g["forget"]
-                    expr = g["expr"]
-                    cdiag = g["cdiag"]
-                    cs_log_f, cs_ratio = precompute_prefixes_lstm(forget, expr, cdiag)
+            cs_log, cs_ratio = precompute_prefix_sums(leak, rdiag)
 
             for ell in ells_list:
-                if ell <= 0 or ell >= Tdg:
+                # envelope μ (for mu_mean, log_mu_mean, per-unit)
+                mu_env0, mu_env1, mu_env = mu_for_envelope_from_prefix(
+                    cs_log, cs_ratio, ell, out_dtype=torch.float64
+                )
+                if mu_env0.numel() > 0:
+                    abs_gate_only = torch.abs(mu_env0).double()
+                    gates_mass = (args.lr * abs_gate_only.sum(dim=2).mean(dim=1)).sum().item()
+                    sum_mass_gates[ell] += float(gates_mass)
+                    sum_unit_gates[ell] += (
+                        args.lr * abs_gate_only.mean(dim=1).sum(dim=0)
+                    ).detach().cpu().numpy()
+                if use_lag_dependent and mu_env.numel() > 0:
+                    Lambda_ell_env = compute_lag_dependent_rates(
+                        lambda_matrix, hseq, mu_env.shape[1], Lambda_q_fallback)
+                    Lambda_ell_env = Lambda_ell_env.to(mu_env.dtype)
+                    mu_env = mu_env * Lambda_ell_env
+                    mu_env0 = mu_env0 * Lambda_ell_env
+                    mu_env1 = mu_env1 * Lambda_ell_env
+                    lam_flat = Lambda_ell_env.detach().double()
+                    lam_mean_val = lam_flat.mean().item()
+                    lam_sq_val = (lam_flat ** 2).mean().item()
+                    n_lam = int(lam_flat.numel())
+                    sum_lambda_mean[ell] += lam_mean_val * n_lam
+                    sum_lambda_sq[ell] += lam_sq_val * n_lam
+                    count_lambda[ell] += n_lam
+                    del Lambda_ell_env
+                else:
+                    fallback = Lambda_q_fallback.unsqueeze(0).unsqueeze(0)
+                    mu_env = mu_env * fallback
+                    mu_env0 = mu_env0 * fallback
+                    mu_env1 = mu_env1 * fallback
+                if mu_env.numel() > 0:
+                    abs_mu = torch.abs(mu_env).double()
+                    abs_mu0 = torch.abs(mu_env0).double()
+                    abs_mu1 = torch.abs(mu_env1).double()
+                    # f(ℓ) = Σ_q |μ^(q)_{t,ℓ}|  (sum over neurons, avg over time & seqs)
+                    mass_per_seq = abs_mu.sum(dim=2).mean(dim=1)  # (Bb,)
+                    sum_mass[ell] += float(mass_per_seq.sum().item())
+                    sum_log_mass[ell] += float(torch.log(mass_per_seq + 1e-30).sum().item())
+                    count_seq[ell] += int(mass_per_seq.shape[0])
+                    sum_unit[ell] += abs_mu.mean(dim=1).sum(dim=0).detach().cpu().numpy()
+                    sum_unit_zero_order[ell] += abs_mu0.mean(dim=1).sum(dim=0).detach().cpu().numpy()
+                    sum_unit_first_order[ell] += abs_mu1.mean(dim=1).sum(dim=0).detach().cpu().numpy()
+
+                # matched-statistic μ and ψ
+                mu0, mu1, mu_all = mu_for_matched_stat_from_prefix(cs_log, cs_ratio, ell, out_dtype=torch.float64)
+                mu_used = mu_all if bool(args.include_first_order_diag) else mu0
+                if use_lag_dependent and mu_used.numel() > 0:
+                    Lambda_ell_ms = compute_lag_dependent_rates(
+                        lambda_matrix, hseq, mu_used.shape[1], Lambda_q_fallback)
+                    mu_used = mu_used * Lambda_ell_ms.to(mu_used.dtype)
+                    del Lambda_ell_ms
+                else:
+                    mu_used = mu_used * Lambda_q_fallback.unsqueeze(0).unsqueeze(0)
+                if mu_used.numel() == 0:
                     continue
 
-                with torch.no_grad():
-                    if model_name == "gru":
-                        gamma0 = _win_prod_from_cs(cs_log_leak, ell, out_dtype=leak.dtype)
-                        rho0   = _win_prod_from_cs(cs_log_reset, ell, out_dtype=leak.dtype)
-                        eta0   = _win_prod_from_cs(cs_log_eta, ell, out_dtype=leak.dtype)
-                        mu0 = gamma0 + rho0 + eta0
+                delta_all = delta[:, ell:Tdg, :]
+                v_past_all = vseq[:, 0:(Tdg - ell), :]
+                psi_mat = torch.sum(mu_used * delta_all * v_past_all, dim=2)  # (Bb,T-ell)
 
-                        if bool(args.include_first_order_diag):
-                            sum_ratio = _win_sum_from_cs(cs_ratio, ell, out_dtype=leak.dtype)
-                            mu1 = gamma0 * sum_ratio
-                            mu = mu0 + mu1
-                        else:
-                            mu = mu0
+                # Optional global sign convention per lag.
+                if bool(args.orient_matched_statistic_sign):
+                    mu_psi = psi_mat.mean()
+                    if torch.isfinite(mu_psi):
+                        sgn = torch.sign(mu_psi)
+                        if float(sgn.item()) == 0.0:
+                            sgn = torch.tensor(1.0, device=psi_mat.device)
                     else:
-                        prod_f = _win_prod_from_cs(cs_log_f, ell, out_dtype=forget.dtype)
-                        expr_end = expr[:, ell:Tdg, :]
-                        mu0 = expr_end * prod_f
-                        if bool(args.include_first_order_diag):
-                            sum_ratio = _win_sum_from_cs(cs_ratio, ell, out_dtype=forget.dtype)
-                            mu1 = mu0 * sum_ratio
-                            mu = mu0 + mu1
-                        else:
-                            mu = mu0
+                        sgn = torch.tensor(1.0, device=psi_mat.device)
+                    psi_mat = sgn * psi_mat
 
-                    if mu.numel() > 0:
-                        abs_gamma = torch.abs(mu).double()
-                        gates_mass = (args.lr * abs_gamma.sum(dim=2).mean(dim=1)).sum().item()
-                        sum_mass_gates[ell] += float(gates_mass)
-                        sum_unit_gates[ell] += (args.lr * abs_gamma.mean(dim=1).sum(dim=0)).detach().cpu().numpy()
+                # Per-sequence means ψ̄_n(ℓ).
+                psi_seq_means = psi_mat.mean(dim=1).detach().cpu().numpy().astype(np.float64)  # (Bb,)
+                psi_seq_lists[ell].append(psi_seq_means)
 
-                    if use_lag_dependent and mu.numel() > 0:
-                        Lambda_ell = compute_lag_dependent_rates(
-                            lambda_matrix, hseq, mu.shape[1], Lambda_q_fallback)
-                        mu = mu * Lambda_ell.to(mu.dtype)
-                        lam_flat = Lambda_ell.detach().float()
-                        lam_mean_val = lam_flat.mean().item()
-                        lam_sq_val = (lam_flat ** 2).mean().item()
-                        n_lam = int(lam_flat.numel())
-                        sum_lambda_mean[ell] += lam_mean_val * n_lam
-                        sum_lambda_sq[ell] += lam_sq_val * n_lam
-                        count_lambda[ell] += n_lam
-                        del Lambda_ell
-                    else:
-                        mu = mu * Lambda_q_fallback.unsqueeze(0).unsqueeze(0)
+            # free large tensors ASAP
+            del xb, yb, yhat, hseq, g, leak, rdiag, vseq, delta, cs_log, cs_ratio
 
-                with torch.no_grad():
-                    if mu.numel() > 0:
-                        abs_mu = torch.abs(mu).double()
-                        mass_per_seq = abs_mu.sum(dim=2).mean(dim=1)  # (Bb,)
-                        sum_mass[ell] += float(mass_per_seq.sum().item())
-                        sum_log_mass[ell] += float(torch.log(mass_per_seq + 1e-30).sum().item())
-                        count_seq[ell] += int(mass_per_seq.shape[0])
-                        sum_unit[ell] += abs_mu.mean(dim=1).sum(dim=0).detach().cpu().numpy()
+        log(f"[diag:{model_name}] done streaming; computing per-lag statistics")
 
-                with torch.no_grad():
-                    delta_all = delta[:, ell:Tdg, :]             # (Bb,T-ell,H)
-                    v_past_all = vseq[:, 0:(Tdg - ell), :]       # (Bb,T-ell,H)
-                    psi = torch.sum(mu * delta_all * v_past_all, dim=2)  # (Bb,T-ell)
-
-                    # Optional global sign convention per lag.
-                    if bool(args.orient_matched_statistic_sign):
-                        mu_psi = psi.mean()
-                        if torch.isfinite(mu_psi):
-                            sgn = torch.sign(mu_psi)
-                            if float(sgn.item()) == 0.0:
-                                sgn = torch.tensor(1.0, device=psi.device)
-                        else:
-                            sgn = torch.tensor(1.0, device=psi.device)
-                        psi = sgn * psi
-
-                    # Per-sequence means ψ̄_n(ℓ).
-                    psi_seq_means = psi.mean(dim=1).detach().cpu().numpy().astype(np.float64)  # (Bb,)
-                    psi_seq_lists[ell].append(psi_seq_means)
-
-            del xb, yb, yhat, hseq, g, vseq, err, delta
-            if device.type == "cuda" and args.cuda_sync:
-                torch.cuda.synchronize()
-
-        log(f"[run:{model_name}] diag stream done  dt={now_s()-t_diag0:.1f}s")
-        log(f"[run:{model_name}] stats+write start")
+        # --- per-ell stats + summary CSV (delete tmp ASAP)
+        csv_path = os.path.join(outdir, f"{model_name}_summary.csv")
 
         mu_by_ell: Dict[int, float] = {}
         log_mu_by_ell: Dict[int, float] = {}
         Nreq_by_ell_ecf: Dict[int, int] = {}
         Nreq_by_ell_mcc: Dict[int, int] = {}
+        mu_units_by_ell: Dict[int, np.ndarray] = {}
+        mu_units_zero_order_by_ell: Dict[int, np.ndarray] = {}
+        mu_units_first_order_by_ell: Dict[int, np.ndarray] = {}
         alpha_by_ell_ecf: Dict[int, float] = {}
         alpha_by_ell_mcc: Dict[int, float] = {}
-        mu_units_by_ell: Dict[int, np.ndarray] = {}
+        summary_rows = []
+
+        L = len(ells_list)
+        stepL = max(1, L // 10)
 
         # Update min samples threshold from CLI
         global _MIN_SAMPLES_ALPHA
         _MIN_SAMPLES_ALPHA = getattr(args, "min_samples_alpha", 500)
 
-        summary_path = os.path.join(mdir, f"{model_name}_summary.csv")
-        with open(summary_path, "w", newline="") as f:
+        with open(csv_path, "w", newline="") as f:
             wcsv = csv.writer(f)
             wcsv.writerow([
                 "ell", "mu_l1_mean", "log_mu_l1_mean",
@@ -1532,11 +1730,8 @@ def run_for_model(args, model_name: str, mdir: str,
                 "alpha_hat", "sigma_hat", "alpha_reliable", "alpha_method_used",
                 "N_required_ecf", "best_snr_ecf", "err_at_best_snr_ecf", "best_N_ecf",
                 "N_required_mcc", "best_snr_mcc", "err_at_best_snr_mcc", "best_N_mcc",
-                "mbar_scalar", "n_samples", "n_sequences",
+                "mbar_scalar", "n_samples", "n_sequences"
             ])
-
-            L = len(ells_list)
-            stepL = max(1, L // 10)
 
             for i, ell in enumerate(ells_list):
                 if (i == 0) or (i == L - 1) or ((i + 1) % stepL == 0):
@@ -1546,6 +1741,8 @@ def run_for_model(args, model_name: str, mdir: str,
                     mu_mean = float(sum_mass[ell] / count_seq[ell])
                     log_mu_mean = float(sum_log_mass[ell] / count_seq[ell])
                     mu_per_unit = (sum_unit[ell] / count_seq[ell]).astype(np.float64)
+                    mu_zero_order_per_unit = (sum_unit_zero_order[ell] / count_seq[ell]).astype(np.float64)
+                    mu_first_order_per_unit = (sum_unit_first_order[ell] / count_seq[ell]).astype(np.float64)
                     f_gates_ell = float(sum_mass_gates[ell] / count_seq[ell])
                     f_ratio_ell = float(mu_mean / f_gates_ell) if f_gates_ell > 1e-30 else float("nan")
                     if count_lambda[ell] > 0:
@@ -1559,7 +1756,9 @@ def run_for_model(args, model_name: str, mdir: str,
                 else:
                     mu_mean = 0.0
                     log_mu_mean = float("-inf")
-                    mu_per_unit = np.zeros(Hdim, dtype=np.float64)
+                    mu_per_unit = np.zeros(H, dtype=np.float64)
+                    mu_zero_order_per_unit = np.zeros(H, dtype=np.float64)
+                    mu_first_order_per_unit = np.zeros(H, dtype=np.float64)
                     f_gates_ell = 0.0
                     f_ratio_ell = float("nan")
                     lam_mean_ell = float(args.lr)
@@ -1568,6 +1767,8 @@ def run_for_model(args, model_name: str, mdir: str,
                 mu_by_ell[ell] = mu_mean
                 log_mu_by_ell[ell] = log_mu_mean
                 mu_units_by_ell[ell] = mu_per_unit
+                mu_units_zero_order_by_ell[ell] = mu_zero_order_per_unit
+                mu_units_first_order_by_ell[ell] = mu_first_order_per_unit
 
                 psi_seq_arr = np.concatenate(psi_seq_lists[ell]) if psi_seq_lists[ell] else np.array([], dtype=np.float64)
                 n_seq = len(psi_seq_arr)
@@ -1609,7 +1810,7 @@ def run_for_model(args, model_name: str, mdir: str,
                             best_err_ecf = detection_error_on_prefix_arr(psi_seq_arr, Nuse_capped) if n_seq > 0 else float("nan")
                             best_N_ecf = Nuse
 
-                Nreq_by_ell_ecf[ell] = int(N_req_ecf)
+                Nreq_by_ell_ecf[ell] = N_req_ecf
 
                 best_snr_mcc_val, best_err_mcc, best_N_mcc, N_req_mcc = float("nan"), float("nan"), None, -1
                 if _run_mcc:
@@ -1626,7 +1827,7 @@ def run_for_model(args, model_name: str, mdir: str,
                             best_err_mcc = detection_error_on_prefix_arr(psi_seq_arr, Nuse_capped) if n_seq > 0 else float("nan")
                             best_N_mcc = Nuse
 
-                Nreq_by_ell_mcc[ell] = int(N_req_mcc)
+                Nreq_by_ell_mcc[ell] = N_req_mcc
 
                 # Bootstrap confidence intervals for McCulloch estimate
                 alpha_mcc_ci_lo = float("nan")
@@ -1668,79 +1869,115 @@ def run_for_model(args, model_name: str, mdir: str,
                     alpha_method_used = "none"
 
                 wcsv.writerow([
-                    int(ell), float(mu_mean), float(log_mu_mean),
-                    float(f_gates_ell), float(f_ratio_ell),
-                    float(lam_mean_ell), float(lam_std),
-                    float(alpha_ecf), float(sigma_ecf), int(rel_ecf),
-                    float(alpha_mcc), float(sigma_mcc), int(rel_mcc),
-                    float(alpha_mcc_ci_lo), float(alpha_mcc_ci_hi),
-                    int(alpha_methods_agree),
-                    float(alpha_hat), float(sigma_hat_unified), int(alpha_reliable), alpha_method_used,
-                    int(N_req_ecf), float(best_snr_ecf_val), float(best_err_ecf), int(best_N_ecf if best_N_ecf is not None else -1),
-                    int(N_req_mcc), float(best_snr_mcc_val), float(best_err_mcc), int(best_N_mcc if best_N_mcc is not None else -1),
-                    float(mbar), n_seq * max(1, Tdg - ell), n_seq,
+                    ell, mu_mean, log_mu_mean,
+                    f_gates_ell, f_ratio_ell,
+                    lam_mean_ell, lam_std,
+                    alpha_ecf, sigma_ecf, int(rel_ecf),
+                    alpha_mcc, sigma_mcc, int(rel_mcc),
+                    alpha_mcc_ci_lo, alpha_mcc_ci_hi,
+                    alpha_methods_agree,
+                    alpha_hat, sigma_hat_unified, int(alpha_reliable), alpha_method_used,
+                    N_req_ecf, best_snr_ecf_val, best_err_ecf, best_N_ecf if best_N_ecf is not None else -1,
+                    N_req_mcc, best_snr_mcc_val, best_err_mcc, best_N_mcc if best_N_mcc is not None else -1,
+                    mbar, n_seq * max(1, Tdg - ell), n_seq
                 ])
+
+                summary_rows.append({
+                    "ell": ell, "mu_l1_mean": mu_mean, "log_mu_l1_mean": log_mu_mean,
+                    "alpha_ecf": alpha_ecf, "sigma_ecf": sigma_ecf,
+                    "alpha_mcc": alpha_mcc, "sigma_mcc": sigma_mcc,
+                    "alpha_mcc_ci_lo": alpha_mcc_ci_lo, "alpha_mcc_ci_hi": alpha_mcc_ci_hi,
+                    "alpha_methods_agree": alpha_methods_agree,
+                    "alpha_hat": alpha_hat, "sigma_hat": sigma_hat_unified,
+                    "alpha_reliable": alpha_reliable, "alpha_method_used": alpha_method_used,
+                    "N_required_ecf": N_req_ecf, "N_required_mcc": N_req_mcc,
+                    "best_N_ecf": best_N_ecf, "best_N_mcc": best_N_mcc,
+                    "mbar": mbar,
+                    "alpha_ecf_reliable": rel_ecf, "alpha_mcc_reliable": rel_mcc,
+                })
 
                 # Free per-sequence list for this ell to release memory
                 del psi_seq_lists[ell]
 
-        sorted_ells = sorted(mu_units_by_ell.keys())
-        mu_units_path = os.path.join(mdir, f"{model_name}_mu_units.csv")
-        with open(mu_units_path, "w", newline="") as fmu:
-            w = csv.writer(fmu)
-            w.writerow(["ell"] + [f"mu_unit_{q}" for q in range(Hdim)])
-            for e in sorted_ells:
-                w.writerow([int(e)] + [float(v) for v in mu_units_by_ell[e]])
+        log(f"[stats:{model_name}] done")
 
-        # per-unit envelope decomposition: f_gates per unit
-        mu_units_gates_path = os.path.join(mdir, f"{model_name}_mu_units_gates.csv")
-        with open(mu_units_gates_path, "w", newline="") as f_gates_csv:
-            w = csv.writer(f_gates_csv)
-            w.writerow(["ell"] + [f"mu_gates_unit_{q}" for q in range(Hdim)])
-            for e in sorted_ells:
-                gates_unit = (sum_unit_gates[e] / max(1, count_seq[e])).astype(np.float64)
-                w.writerow([int(e)] + [float(v) for v in gates_unit])
+        # Save per-unit μ averages
+        if len(mu_units_by_ell) > 0:
+            sorted_ells = sorted(mu_units_by_ell.keys())
+            ell_values = np.asarray(sorted_ells, dtype=np.int64)
+            mu_units_matrix = np.vstack([mu_units_by_ell[e] for e in sorted_ells]).astype(np.float64)
+            mu_zero_order_matrix = np.vstack(
+                [mu_units_zero_order_by_ell[e] for e in sorted_ells]
+            ).astype(np.float64)
+            mu_first_order_matrix = np.vstack(
+                [mu_units_first_order_by_ell[e] for e in sorted_ells]
+            ).astype(np.float64)
+            mu_units_npz_path = os.path.join(outdir, f"{model_name}_mu_units.npz")
+            save_dense_unit_npz(
+                mu_units_npz_path,
+                ell_values,
+                mu_units_matrix,
+                component="total",
+                rate_scale="adaptive",
+                extra_arrays={
+                    "zero_order_values": mu_zero_order_matrix,
+                    "first_order_values": mu_first_order_matrix,
+                },
+            )
 
-        # per-unit tau fits (always create outputs)
-        tau_list = []
+        # per-unit envelope decomposition (f_gates per unit)
+        if len(mu_units_by_ell) > 0:
+            mu_units_gates_path = os.path.join(outdir, f"{model_name}_mu_units_gates.npz")
+            mu_gates_matrix = np.vstack([
+                (sum_unit_gates[e] / max(1, count_seq[e])).astype(np.float64)
+                for e in sorted_ells
+            ])
+            save_dense_unit_npz(
+                mu_units_gates_path,
+                ell_values,
+                mu_gates_matrix,
+                component="zero_order_gate_only",
+                rate_scale="base_lr",
+            )
+
+        # τ from μ^{(q)}(ℓ) exponential fits
+        tau_q_mu = None
         tau_mu_results = []
-        tau_units_path = os.path.join(mdir, f"{model_name}_tau_from_mu_units.csv")
-        with open(tau_units_path, "w", newline="") as f_tau:
-            fieldnames = ["unit_id", "tau", "C", "a", "b", "r2", "num_points"]
-            writer = csv.DictWriter(f_tau, fieldnames=fieldnames)
-            writer.writeheader()
-            for q in range(Hdim):
+        if len(mu_units_by_ell) > 0:
+            sorted_ells = sorted(mu_units_by_ell.keys())
+            ells_array = np.array(sorted_ells, dtype=float)
+            tau_list = []
+            for q in range(H):
                 mu_vals_q = np.array([mu_units_by_ell[e][q] for e in sorted_ells], dtype=float)
-                fit_res = fit_exponential_tau(sorted_ells, np.abs(mu_vals_q), min_points=5)
-                if fit_res is not None:
-                    tau_list.append(fit_res["tau"])
-                    tau_mu_results.append({"unit_id": q, **fit_res})
-                    row = {"unit_id": q, **fit_res}
-                    writer.writerow({k: row.get(k) for k in fieldnames})
+                fit_res = fit_exponential_tau(ells_array, np.abs(mu_vals_q), min_points=5)
+                if fit_res is None:
+                    continue
+                tau_list.append(fit_res["tau"])
+                tau_mu_results.append({"unit_id": q, **fit_res})
 
-        # stats json
-        tau_stats_path = os.path.join(mdir, f"{model_name}_tau_from_mu_stats.json")
-        if len(tau_list) > 0:
-            tau_arr = np.array(tau_list, dtype=float)
-            with open(tau_stats_path, "w") as jf:
-                json.dump({
+            if tau_list:
+                tau_q_mu = np.array(tau_list, dtype=float)
+                tau_mu_csv = os.path.join(outdir, f"{model_name}_tau_from_mu_units.csv")
+                with open(tau_mu_csv, "w", newline="") as f_tau_mu:
+                    fieldnames = ["unit_id", "tau", "C", "a", "b", "r2", "num_points"]
+                    writer = csv.DictWriter(f_tau_mu, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for row in tau_mu_results:
+                        writer.writerow({k: row.get(k) for k in fieldnames})
+
+                tau_mu_stats = {
                     "model": model_name,
-                    "num_units": int(tau_arr.size),
-                    "tau_min": float(np.min(tau_arr)),
-                    "tau_max": float(np.max(tau_arr)),
-                    "tau_mean": float(np.mean(tau_arr)),
-                    "tau_std": float(np.std(tau_arr)),
-                }, jf, indent=2)
-        else:
-            with open(tau_stats_path, "w") as jf:
-                json.dump({
-                    "model": model_name,
-                    "num_units": 0,
-                    "note": "No valid exponential fits (mu_unit too small/non-positive or insufficient points).",
-                }, jf, indent=2)
+                    "num_units": int(len(tau_q_mu)),
+                    "tau_min": float(np.min(tau_q_mu)),
+                    "tau_max": float(np.max(tau_q_mu)),
+                    "tau_mean": float(np.mean(tau_q_mu)),
+                    "tau_std": float(np.std(tau_q_mu)),
+                }
+                with open(os.path.join(outdir, f"{model_name}_tau_from_mu_stats.json"), "w") as jf:
+                    json.dump(tau_mu_stats, jf, indent=2)
 
         # Per-neuron Λ_q × τ_q correlation.
-        if len(tau_mu_results) >= 5:
+        if tau_q_mu is not None and len(tau_q_mu) >= 5:
             tau_unit_ids = np.array([r["unit_id"] for r in tau_mu_results], dtype=int)
             tau_vals = np.array([r["tau"] for r in tau_mu_results], dtype=float)
             lam_vals = Lambda_q_rowmean[tau_unit_ids]
@@ -1749,6 +1986,7 @@ def run_for_model(args, model_name: str, mdir: str,
             mu_at_max_ell = mu_units_by_ell[max_ell][tau_unit_ids]
 
             def _spearman_r(x, y):
+                """Spearman rank correlation via numpy."""
                 n = len(x)
                 if n < 3:
                     return float("nan")
@@ -1764,12 +2002,14 @@ def run_for_model(args, model_name: str, mdir: str,
                 return float((rx * ry).sum() / denom)
 
             rho_lam_tau = _spearman_r(lam_vals, tau_vals)
+            # Pearson correlation (linear)
             pearson_lam_tau = float(np.corrcoef(lam_vals, tau_vals)[0, 1]) if len(lam_vals) >= 3 else float("nan")
 
             log(f"[lambda_tau:{model_name}] Spearman ρ(Λ_q, τ_q) = {rho_lam_tau:.3f}, "
                 f"Pearson r = {pearson_lam_tau:.3f}  (n={len(tau_vals)} neurons)")
 
-            lt_csv_path = os.path.join(mdir, f"{model_name}_lambda_tau_correlation.csv")
+            # Write per-neuron CSV: {model}_lambda_tau_correlation.csv
+            lt_csv_path = os.path.join(outdir, f"{model_name}_lambda_tau_correlation.csv")
             with open(lt_csv_path, "w", newline="") as flt:
                 lt_writer = csv.writer(flt)
                 lt_writer.writerow(["neuron_q", "Lambda_q", "tau_q", "mu_at_max_ell"])
@@ -1781,6 +2021,7 @@ def run_for_model(args, model_name: str, mdir: str,
                         float(mu_at_max_ell[j])
                     ])
 
+            # Write summary JSON with correlation stats
             lt_stats = {
                 "model": model_name,
                 "n_neurons": int(len(tau_vals)),
@@ -1798,26 +2039,100 @@ def run_for_model(args, model_name: str, mdir: str,
                     "approximately_uniform"
                 ),
             }
-            with open(os.path.join(mdir, f"{model_name}_lambda_tau_stats.json"), "w") as jf:
+            with open(os.path.join(outdir, f"{model_name}_lambda_tau_stats.json"), "w") as jf:
                 json.dump(lt_stats, jf, indent=2)
 
-        log(f"[run:{model_name}] stats+write done")
+        # ConstGate closed-form τ
+        tau_const = None
+        s_const = model.get_const_gate_s()
+        if s_const is not None:
+            leak_val = np.clip(1.0 - float(s_const), 1e-6, 1.0 - 1e-6)
+            tau_const = float(-1.0 / np.log(leak_val))
+            with open(os.path.join(outdir, f"{model_name}_tau_const.json"), "w") as jf:
+                json.dump({"s": float(s_const), "leak": float(leak_val), "tau": tau_const}, jf, indent=2)
+
+        log(f"[run:{model_name}] finished")
 
         return {
-            "model": model_name,
-            "ells": sorted_ells,
+            "ells": np.array(ells_list, dtype=int),
             "mu_by_ell": mu_by_ell,
             "log_mu_by_ell": log_mu_by_ell,
             "Nreq_by_ell_ecf": Nreq_by_ell_ecf,
             "Nreq_by_ell_mcc": Nreq_by_ell_mcc,
+            "summary_rows": summary_rows,
+            "tau_q_mu": tau_q_mu,
+            "tau_const": tau_const,
             "alpha_by_ell_ecf": alpha_by_ell_ecf,
             "alpha_by_ell_mcc": alpha_by_ell_mcc,
         }
 
     except Exception:
-        log(f"[ERROR:{model_name}] failed.")
+        log(f"[ERROR] run_for_model({model_name}) failed.")
         traceback.print_exc()
         raise
+
+
+# ============================================================
+# Envelope regime fits & learnability window H_N
+#
+# The envelope f̂(ℓ) summarises how quickly the memory kernel
+# decays with lag.  We fit two competing models:
+#   - Exponential: log f̂(ℓ) = a + b·ℓ  →  τ_env = -1/b
+#   - Power-law:   log f̂(ℓ) = c + d·log(ℓ)
+# and report R² for both to let the user judge which regime holds.
+#
+# The learnability window H_N is the maximum lag ℓ that can be
+# detected with N training samples (i.e. N_required(ℓ) ≤ N).
+# ============================================================
+
+def fit_envelope_regimes(ells: np.ndarray, mu_vals: np.ndarray, log_mu_vals: np.ndarray) -> Dict:
+    """
+    Fit exponential and power-law models to the envelope f̂(ℓ).
+
+    Returns a dict with sub-dicts "exp" and "power", each containing
+    fit coefficients and R² values.
+    """
+    mask = np.isfinite(log_mu_vals)
+    ells_fit = ells[mask]
+    log_mu_fit = log_mu_vals[mask]
+    if ells_fit.size < 3:
+        return {}
+
+    ss_tot = float(np.sum((log_mu_fit - log_mu_fit.mean()) ** 2) + 1e-12)
+
+    A_exp = np.vstack([np.ones_like(ells_fit), ells_fit]).T
+    coeff_exp, _, _, _ = np.linalg.lstsq(A_exp, log_mu_fit, rcond=None)
+    pred_log_mu_exp = A_exp @ coeff_exp
+    ss_res_exp = float(np.sum((log_mu_fit - pred_log_mu_exp) ** 2))
+    r2_exp = 1.0 - ss_res_exp / ss_tot
+    b_exp = float(coeff_exp[1])
+    tau_env = float(-1.0 / b_exp) if b_exp < 0 else float("inf")
+
+    log_ell = np.log(ells_fit.astype(float) + 1e-8)
+    A_pow = np.vstack([np.ones_like(log_ell), log_ell]).T
+    coeff_pow, _, _, _ = np.linalg.lstsq(A_pow, log_mu_fit, rcond=None)
+    pred_log_mu_pow = A_pow @ coeff_pow
+    ss_res_pow = float(np.sum((log_mu_fit - pred_log_mu_pow) ** 2))
+    r2_pow = 1.0 - ss_res_pow / ss_tot
+
+    return {
+        "exp": {"a": float(coeff_exp[0]), "b": b_exp, "r2": float(r2_exp), "tau_env": tau_env},
+        "power": {"c": float(coeff_pow[0]), "d": float(coeff_pow[1]), "r2": float(r2_pow)}
+    }
+
+
+def compute_H_N(ells: np.ndarray, Nreq_by_ell: Dict[int, int], N_values: List[int]) -> Dict[int, int]:
+    """
+    Compute the learnability window H_N for each training budget N.
+
+    H_N = max{ℓ : N_required(ℓ) ≤ N}, i.e. the longest lag detectable
+    with N samples.  Returns {N: H_N} dict.
+    """
+    H_by_N = {}
+    for N in N_values:
+        reachable = [ell for ell in ells if (Nreq_by_ell.get(int(ell), -1) != -1 and Nreq_by_ell[int(ell)] <= N)]
+        H_by_N[int(N)] = int(max(reachable)) if reachable else 0
+    return H_by_N
 
 
 # ============================================================
@@ -1825,17 +2140,16 @@ def run_for_model(args, model_name: str, mdir: str,
 # ============================================================
 
 def parse_args():
-    """Parse command-line arguments for the LSTM/GRU learnability pipeline."""
+    """Parse command-line arguments for the baselines learnability pipeline."""
     p = argparse.ArgumentParser(
-        description="Learnability-window pipeline for LSTM and GRU (see paper)."
+        description="Learnability-window pipeline for baseline gated RNNs (see paper)."
     )
 
     # --- Run identity -----------------------------------------------------------
     p.add_argument("--outdir", type=str, required=True,
                    help="Root output directory; per-model sub-dirs created automatically.")
-    p.add_argument("--models", type=str, default="lstm,gru",
+    p.add_argument("--models", type=str, default="const,shared,diag",
                    help="Comma-separated model names to train+diagnose.")
-
     p.add_argument("--seed", type=int, default=123)
 
     # --- Data geometry ----------------------------------------------------------
@@ -1843,7 +2157,6 @@ def parse_args():
                    help="Number of training sequences.")
     p.add_argument("--Nseq_diag", type=int, default=8000,
                    help="Number of diagnostic sequences (separate from training).")
-
     p.add_argument("--T", type=int, default=1024,
                    help="Sequence length (timesteps).")
     p.add_argument("--D", type=int, default=16,
@@ -1852,7 +2165,8 @@ def parse_args():
                    help="Hidden-state dimensionality.")
 
     # --- Optimizer --------------------------------------------------------------
-    p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sgd", "sgd_momentum", "rmsprop"])
+    p.add_argument("--optimizer", type=str, default="adamw",
+                   choices=["adamw", "sgd", "sgd_momentum", "rmsprop"])
     p.add_argument("--momentum", type=float, default=0.9)
     p.add_argument("--rmsprop_alpha", type=float, default=0.99,
                    help="Smoothing coefficient for RMSprop's running average of "
@@ -1863,13 +2177,18 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
 
+    # --- Gate initialisation ----------------------------------------------------
+    # const_s sets BOTH the ConstGateRNN fixed value AND the initial sigmoid
+    # operating point for SharedGate/DiagGate (via logit(const_s) bias).
+    # Default 0.005 → τ ≈ 200 steps, covering task lags up to 512.
+    p.add_argument("--const_s", type=float, default=0.005)
+
     # --- Diagnostic lag grid ----------------------------------------------------
     p.add_argument("--lag_min", type=int, default=4)
     p.add_argument("--lag_max", type=int, default=128)
     p.add_argument("--num_lags", type=int, default=32)
 
     # --- Task definition (multi-lag regression) ---------------------------------
-    # Same task as baselines script for direct comparability.
     p.add_argument("--task_lags", type=str, default="32,64,128,256,512",
                    help="Comma-separated task lag values ℓ_k.")
     p.add_argument("--task_coeffs", type=str, default="0.6,0.45,0.35,0.28,0.22",
@@ -1880,7 +2199,19 @@ def parse_args():
     p.add_argument("--N_grid", type=str, default="25,50,100,150,200,400,800,1600,3200,6400,12800",
                    help="Comma-separated training budgets to scan for N_required.")
     p.add_argument("--eps", type=float, default=0.1,
-                   help="SNR detection threshold: lag is detectable when SNR > eps.")
+                   help=(
+                       "Raw SNR detection threshold: lag is detectable when SNR > eps. "
+                       "Larger eps is stricter. Kept for backward compatibility; "
+                       "prefer --noise_tolerance for a more interpretable interface."
+                   ))
+    p.add_argument("--noise_tolerance", type=float, default=None,
+                   help=(
+                       "User-facing inverse threshold in (0, 1]. "
+                       "Defined as noise_tolerance = 1 / eps, so smaller values are stricter. "
+                       "Example: --noise_tolerance 0.1 means require SNR > 10, i.e. "
+                       "the effective noise-to-signal ratio in the detection metric "
+                       "must be below about 10%%. Overrides --eps when provided."
+                   ))
 
     # --- Alpha estimation -------------------------------------------------------
     p.add_argument("--alpha_methods", type=str, default="ecf,mcc",
@@ -1892,7 +2223,8 @@ def parse_args():
                    ))
     p.add_argument("--min_samples_alpha", type=int, default=500,
                    help=(
-                       "Minimum samples required for a reliable α̂ estimate. "
+                       "Minimum number of matched-statistic samples required for a reliable "
+                       "α̂ estimate. Lags with fewer samples are flagged as unreliable. "
                        "Default: 500."
                    ))
     p.add_argument("--alpha_n_boot", type=int, default=200,
@@ -1905,27 +2237,18 @@ def parse_args():
     p.add_argument("--w_seed", type=int, default=12345,
                    help="Seed for the random tangent direction w in JVP computation.")
     p.add_argument("--include_first_order_diag", type=int, default=1,
-                   help="If 1, include first-order correction in matched-stat kernel.")
+                   help="If 1, include first-order rdiag correction in matched-stat kernel.")
 
     # --- Init / normalisation switches ------------------------------------------
     p.add_argument("--orth_init", action="store_true",
                    help="Apply orthogonal init to recurrent weights (respects _skip_orth).")
     p.add_argument("--layernorm", action="store_true",
-                   help="Enable LayerNorm on candidate pre-activation.")
-
+                   help="Enable LayerNorm on pre-activation (before tanh).")
     p.add_argument("--log_gate_stats", type=int, default=1)
     p.add_argument("--gate_log_every", type=int, default=10)
 
     # --- Device -----------------------------------------------------------------
     p.add_argument("--device", type=str, default="cuda", choices=["auto", "cpu", "mps", "cuda"])
-
-    # --- DGX-specific knobs (optional; safe defaults) ---------------------------
-    p.add_argument("--diag_batch_size", type=int, default=128,
-                   help="Diagnostic batch size for streaming.")
-    p.add_argument("--diag_log_every", type=int, default=10,
-                   help="Print diag progress every N diag batches.")
-    p.add_argument("--cuda_sync", type=int, default=0,
-                   help="If 1, synchronize CUDA each diag batch (debug).")
 
     # --- Matched-statistic sign orientation (see theory note in run_for_model) --
     p.add_argument(
@@ -1940,11 +2263,19 @@ def parse_args():
 
     args = p.parse_args()
 
-    args.task_lags = [int(s) for s in args.task_lags.split(",") if s.strip() != ""]
-    args.task_coeffs = [float(s) for s in args.task_coeffs.split(",") if s.strip() != ""]
-    args.N_grid = [int(s) for s in args.N_grid.split(",") if s.strip() != ""]
+    args.task_lags = [int(s) for s in args.task_lags.split(",") if s.strip()]
+    args.task_coeffs = [float(s) for s in args.task_coeffs.split(",") if s.strip()]
+    assert len(args.task_lags) == len(args.task_coeffs)
 
-    args.cuda_sync = bool(int(args.cuda_sync))
+    args.N_grid = [int(s) for s in args.N_grid.split(",") if s.strip()]
+
+    if args.noise_tolerance is not None:
+        args.eps = noise_tolerance_to_eps(args.noise_tolerance)
+    if args.eps <= 0:
+        raise ValueError(f"--eps must be positive, got {args.eps}")
+    args.eps = float(args.eps)
+    args.eps_raw = float(args.eps)
+    args.noise_tolerance = float(1.0 / args.eps)
 
     # Parse alpha methods set
     _valid_alpha = {"ecf", "mcc"}
@@ -1954,6 +2285,7 @@ def parse_args():
     args.alpha_methods = args.alpha_methods & _valid_alpha
 
     return args
+
 
 def resolve_device(requested: str) -> torch.device:
     """Map 'auto'/'cpu'/'cuda'/'mps' to a concrete torch.device."""
@@ -1970,7 +2302,7 @@ def resolve_device(requested: str) -> torch.device:
 
 def main():
     """
-    Run the full learnability pipeline for LSTM/GRU models.
+    Run the full learnability pipeline for baseline models.
 
     Steps:
       1. Parse CLI, set seed, resolve device.
@@ -1983,7 +2315,6 @@ def main():
     """
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
-    save_args_to_csv(args, os.path.join(args.outdir, "cli_args.csv"))
 
     set_seed(args.seed)
 
@@ -1993,15 +2324,15 @@ def main():
         props = torch.cuda.get_device_properties(0)
         log(f"GPU: {props.name}")
 
+    save_args_to_csv(args, os.path.join(args.outdir, "cli_args.csv"))
+
     # CPU datasets (pinned for fast H2D transfers on CUDA).
     # Training and diagnostic sets share the same task direction u_vec
     # so the target function is identical across sets.
-    Xtr_cpu, Ytr_cpu, u_vec = make_dataset_cpu(
-        args.Nseq_train, args.T, args.D, args.task_lags, args.task_coeffs, args.noise_std, u_vec=None
-    )
-    Xdg_cpu, Ydg_cpu, _ = make_dataset_cpu(
-        args.Nseq_diag, args.T, args.D, args.task_lags, args.task_coeffs, args.noise_std, u_vec=u_vec
-    )
+    Xtr_cpu, Ytr_cpu, u_vec = make_dataset_cpu(args.Nseq_train, args.T, args.D,
+                                               args.task_lags, args.task_coeffs, args.noise_std, u_vec=None)
+    Xdg_cpu, Ydg_cpu, _ = make_dataset_cpu(args.Nseq_diag, args.T, args.D,
+                                           args.task_lags, args.task_coeffs, args.noise_std, u_vec=u_vec)
 
     log(f"Train set CPU: X={tuple(Xtr_cpu.shape)} Y={tuple(Ytr_cpu.shape)}")
     log(f"Diag  set CPU: X={tuple(Xdg_cpu.shape)} Y={tuple(Ydg_cpu.shape)}")
@@ -2012,56 +2343,56 @@ def main():
         Xdg_cpu = Xdg_cpu.pin_memory()
         Ydg_cpu = Ydg_cpu.pin_memory()
 
-    models = [m.strip().lower() for m in args.models.split(",") if m.strip() != ""]
-    results = []
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
+    results_by_model = {}
 
     for mname in models:
         mdir = os.path.join(args.outdir, mname)
         os.makedirs(mdir, exist_ok=True)
-        log(f"[main] start model={mname} -> {mdir}")
+        log(f"[run] model={mname} -> {mdir}")
 
         # Train + run full diagnostic pipeline for this model
         res = run_for_model(args, mname, mdir, Xtr_cpu, Ytr_cpu, Xdg_cpu, Ydg_cpu, device=device, u_vec=u_vec)
 
         # Fit competing envelope decay regimes (exponential vs power-law)
         ells = np.array(res["ells"], dtype=int)
-        mu_vals = np.array([res["mu_by_ell"][int(e)] for e in ells], dtype=float)
-        log_mu_vals = np.array([res["log_mu_by_ell"][int(e)] for e in ells], dtype=float)
+        mu_vals = np.array([res["mu_by_ell"][int(e)] for e in ells])
+        log_mu_vals = np.array([res["log_mu_by_ell"][int(e)] for e in ells])
 
         fit_info = fit_envelope_regimes(ells, mu_vals, log_mu_vals)
         with open(os.path.join(mdir, f"{mname}_envelope_fits.json"), "w") as jf:
             json.dump(fit_info, jf, indent=2)
 
         # Compute learnability window H_N = max detectable lag given N samples
-        H_by_N_ecf = compute_H_N(res["ells"], res["Nreq_by_ell_ecf"], args.N_grid)
-        H_by_N_mcc = compute_H_N(res["ells"], res["Nreq_by_ell_mcc"], args.N_grid)
+        H_by_N_ecf = compute_H_N(ells, res["Nreq_by_ell_ecf"], args.N_grid)
+        H_by_N_mcc = compute_H_N(ells, res["Nreq_by_ell_mcc"], args.N_grid)
         res["H_by_N_ecf"] = H_by_N_ecf
         res["H_by_N_mcc"] = H_by_N_mcc
-
         with open(os.path.join(mdir, f"{mname}_H_N.csv"), "w", newline="") as hf:
             wcsv = csv.writer(hf)
             wcsv.writerow(["N", "H_N_ecf", "H_N_mcc"])
             for N in sorted(set(list(H_by_N_ecf.keys()) + list(H_by_N_mcc.keys()))):
-                wcsv.writerow([int(N), int(H_by_N_ecf.get(N, 0)), int(H_by_N_mcc.get(N, 0))])
-        results.append(res)
+                wcsv.writerow([N, H_by_N_ecf.get(N, 0), H_by_N_mcc.get(N, 0)])
 
-        log(f"[main] done model={mname}")
+        results_by_model[mname] = res
 
-    # Write aggregate H_N summary: one row per N, one column per model (both ECF and McCulloch)
-    with open(os.path.join(args.outdir, "H_N_summary.csv"), "w", newline="") as hf:
+    # Write aggregate H_N summary: one row per N, one column per model and method
+    H_summary_path = os.path.join(args.outdir, "H_N_summary.csv")
+    with open(H_summary_path, "w", newline="") as hf:
         wcsv = csv.writer(hf)
         header = ["N"]
         for m in models:
             header += [f"H_N_{m}_ecf", f"H_N_{m}_mcc"]
         wcsv.writerow(header)
         for N in args.N_grid:
-            row = [int(N)]
-            for res in results:
-                row.append(int(res["H_by_N_ecf"].get(int(N), 0)))
-                row.append(int(res["H_by_N_mcc"].get(int(N), 0)))
+            row = [N]
+            for m in models:
+                row.append(results_by_model[m]["H_by_N_ecf"].get(N, 0))
+                row.append(results_by_model[m]["H_by_N_mcc"].get(N, 0))
             wcsv.writerow(row)
 
-    log(f"Done. Results saved to: {args.outdir}")
+    log("All models done.")
+    log("Done.")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-launch_multiseed.py — Wrapper to run baselines + lstm/gru DGX scripts
-across multiple random seeds.
+launch_multiseed.py — Wrapper to run the baseline and LSTM/GRU training
+scripts across multiple random seeds.
 
-Does NOT modify the DGX scripts. Simply calls them with different --seed
-values, writing outputs to seed-tagged subdirectories:
+Does NOT modify the training scripts. It simply calls them with different
+--seed values, writing outputs to seed-tagged subdirectories:
     <outdir_baselines>/seed_<S>/
     <outdir_lstm_gru>/seed_<S>/
 
@@ -83,10 +83,10 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "If set, pass this fixed seed for data generation to the DGX scripts "
+            "If set, pass this fixed seed for data generation to the training scripts "
             "via --data_seed, so that every run uses the SAME synthetic dataset "
             "while varying model initialisation through --seed. "
-            "Requires a small patch to the DGX scripts (see EXAMPLES.txt). "
+            "Requires adding a matching --data_seed option to those scripts. "
             "If not set, each --seed controls both data and model randomness (default)."
         ),
     )
@@ -97,8 +97,8 @@ def parse_args():
         choices=["ecf", "mcculloch"],
         help=(
             "Method for estimating the stable tail index α̂. "
-            "Passed through to DGX scripts via --alpha_method. "
-            "If not set, the DGX scripts use their default (ecf)."
+            "Passed through to the training scripts via --alpha_method. "
+            "If not set, those scripts use their default (ecf)."
         ),
     )
     p.add_argument(
@@ -107,21 +107,21 @@ def parse_args():
         default=None,
         help=(
             "Minimum samples for reliable α̂ estimate. "
-            "Passed through to DGX scripts via --min_samples_alpha. "
-            "If not set, DGX scripts use their default (500)."
+            "Passed through to the training scripts via --min_samples_alpha. "
+            "If not set, those scripts use their default (500)."
         ),
     )
     p.add_argument(
         "--baseline_script",
         type=str,
-        default="run_learnability_DGX.py",
-        help="Path to baseline DGX script",
+        default="run_learnability_baselines.py",
+        help="Path to the baseline training script",
     )
     p.add_argument(
         "--lstm_gru_script",
         type=str,
-        default="run_learnability_lstm_gru_DGX.py",
-        help="Path to lstm/gru DGX script",
+        default="run_learnability_lstm_gru.py",
+        help="Path to the LSTM/GRU training script",
     )
     p.add_argument(
         "--logdir",

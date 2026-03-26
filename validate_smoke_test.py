@@ -13,14 +13,15 @@ import csv
 import json
 import os
 import sys
+import numpy as np
 
 # ── Expected outputs per model ──────────────────────────────────
 
 # Files every model should produce
 REQUIRED_FILES = [
     "{model}_summary.csv",
-    "{model}_mu_units.csv",
-    "{model}_mu_units_gates.csv",
+    "{model}_mu_units.npz",
+    "{model}_mu_units_gates.npz",
     "{model}_adaptive_base_rates.csv",
     "{model}_tau_from_mu_units.csv",
     "{model}_tau_from_mu_stats.json",
@@ -131,6 +132,31 @@ def check_json_keys(path, expected_keys):
     return issues
 
 
+def check_dense_npz(path, required_keys):
+    """Check NPZ has required arrays and consistent dense-matrix shape."""
+    issues = []
+    try:
+        data = np.load(path, allow_pickle=False)
+    except Exception as e:
+        return [f"Cannot read NPZ: {e}"]
+
+    missing = set(required_keys) - set(data.files)
+    if missing:
+        return [f"Missing NPZ arrays: {missing}"]
+
+    ell = np.asarray(data["ell"])
+    values = np.asarray(data["values"])
+    if ell.ndim != 1:
+        issues.append("'ell' must be 1-D")
+    if values.ndim != 2:
+        issues.append("'values' must be 2-D")
+    elif ell.ndim == 1 and values.shape[0] != ell.shape[0]:
+        issues.append(f"Shape mismatch: len(ell)={ell.shape[0]} but values.shape[0]={values.shape[0]}")
+    if values.size == 0:
+        issues.append("Dense matrix is empty")
+    return issues
+
+
 def validate_model(model_dir, model_name):
     """Validate all outputs for a single model. Returns (pass_count, fail_count, messages)."""
     passes = 0
@@ -149,6 +175,27 @@ def validate_model(model_dir, model_name):
 
     # 2) Check summary CSV schema
     summary_path = os.path.join(model_dir, f"{model_name}_summary.csv")
+    mu_npz_path = os.path.join(model_dir, f"{model_name}_mu_units.npz")
+    gates_npz_path = os.path.join(model_dir, f"{model_name}_mu_units_gates.npz")
+
+    if os.path.isfile(mu_npz_path):
+        issues = check_dense_npz(mu_npz_path, {"ell", "values", "zero_order_values", "first_order_values"})
+        if issues:
+            fails += 1
+            for iss in issues:
+                messages.append(f"  NPZ {model_name}_mu_units.npz: {iss}")
+        else:
+            passes += 1
+
+    if os.path.isfile(gates_npz_path):
+        issues = check_dense_npz(gates_npz_path, {"ell", "values"})
+        if issues:
+            fails += 1
+            for iss in issues:
+                messages.append(f"  NPZ {model_name}_mu_units_gates.npz: {iss}")
+        else:
+            passes += 1
+
     if os.path.isfile(summary_path):
         issues = check_csv_schema(summary_path, SUMMARY_EXPECTED_COLS, BANNED_COLS)
         if issues:

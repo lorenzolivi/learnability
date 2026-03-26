@@ -8,7 +8,7 @@ plotting utilities (replot_envelopes.py, replot_tau.py).
 
 Reads (per architecture, across seeds, if present):
   - <arch>_summary.csv     (needs columns: ell/lag and mu_l1_mean or mu_mean)
-  - <arch>_mu_units.csv    (needs first column ell/lag + per-unit mu^{(q)}(ell))
+  - <arch>_mu_units.npz    (preferred; falls back to legacy CSV)
 
 Aggregates mu_l1_mean across seeds on ell grid, optionally with ±1std band.
 Pools tau values across seeds for histograms.
@@ -200,21 +200,12 @@ def read_summary(path: str):
 
 def read_mu_units(path: str):
     """
-    Reads per-unit mu^{(q)}(ell) matrix from <arch>_mu_units.csv.
-    Assumes first column is ell/lag/l (or falls back to first col).
+    Reads per-unit mu^{(q)}(ell) matrix from <arch>_mu_units.npz or legacy CSV.
     Returns:
       ell: (L,)
       units: (L, H)
     """
-    df = pd.read_csv(path)
-
-    ell_col = _find_col(df, ["ell", "lag", "l"])
-    if ell_col is None:
-        ell_col = df.columns[0]
-
-    ell = pd.to_numeric(df[ell_col], errors="coerce").to_numpy(dtype=float)
-    units = df.drop(columns=[ell_col]).apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-    return ell, units
+    return seed_utils.load_dense_unit_artifact(path)
 
 # ── Clamp utilities ────────────────────────────────────────────────────
 
@@ -606,7 +597,7 @@ def detect_archs_in_seed_dirs(seed_dirs: list[str], arch_map: dict, require_mu_u
             if summ is None:
                 continue
             if require_mu_units:
-                mu_u = seed_utils.find_file_in_seed_dir(sd, f"{a}_mu_units.csv", a)
+                mu_u = seed_utils.find_dense_artifact_in_seed_dir(sd, f"{a}_mu_units", a)
                 if mu_u is None:
                     continue
             found.add(a)
@@ -653,7 +644,7 @@ def main():
     if not archs:
         raise FileNotFoundError(
             f"No usable architectures found in seed dirs. "
-            "Need at least one pair: <arch>_summary.csv and <arch>_mu_units.csv."
+            "Need at least one pair: <arch>_summary.csv and <arch>_mu_units.(npz|csv)."
         )
 
     print(f"[info] detected architectures: {archs}")
@@ -716,7 +707,7 @@ def main():
         # Load mu_units across seeds (supports flat and nested layouts)
         units_list = []
         for sd in seed_dirs:
-            mu_u_path = seed_utils.find_file_in_seed_dir(sd, f"{a}_mu_units.csv", a)
+            mu_u_path = seed_utils.find_dense_artifact_in_seed_dir(sd, f"{a}_mu_units", a)
             if mu_u_path is None:
                 continue
             try:

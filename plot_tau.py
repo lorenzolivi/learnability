@@ -120,13 +120,11 @@ def _vlines_rug(ax, x, base_y, height, label=None):
 
 
 def estimate_tau_from_mu_units(path, min_points=3, mu_floor=1e-300):
-    df = _safe_read_csv(path)
-    if df is None or df.shape[1] < 2:
+    try:
+        ell, units = seed_utils.load_dense_unit_artifact(path)
+    except Exception as e:
+        print(f"  [warn] failed reading {os.path.basename(path)}: {e}")
         return np.array([], dtype=float)
-
-    ell_col = "ell" if "ell" in df.columns else df.columns[0]
-    ell = pd.to_numeric(df[ell_col], errors="coerce").to_numpy(dtype=float)
-    units = df.drop(columns=[ell_col]).apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
 
     taus = []
     for q in range(units.shape[1]):
@@ -164,7 +162,7 @@ def load_tau_mu(seed_dirs, model, args):
                         all_taus.append(tau_vals)
                     continue
 
-        mu_units = seed_utils.find_file_in_seed_dir(indir, f"{model}_mu_units.csv", model)
+        mu_units = seed_utils.find_dense_artifact_in_seed_dir(indir, f"{model}_mu_units", model)
         if mu_units is not None:
             tau_vals = estimate_tau_from_mu_units(mu_units, min_points=args.min_points, mu_floor=args.mu_floor)
             if tau_vals.size > 0:
@@ -212,7 +210,7 @@ def detect_models(seed_dirs):
     for indir in seed_dirs:
         for m in CANDIDATE_MODELS:
             if (
-                seed_utils.find_file_in_seed_dir(indir, f"{m}_mu_units.csv", m) is not None
+                seed_utils.find_dense_artifact_in_seed_dir(indir, f"{m}_mu_units", m) is not None
                 or seed_utils.find_file_in_seed_dir(indir, f"{m}_tau_from_mu_units.csv", m) is not None
                 or seed_utils.find_file_in_seed_dir(indir, f"{m}_tau_from_gate.csv", m) is not None
                 or seed_utils.find_file_in_seed_dir(indir, f"{m}_tau_from_gate_units.csv", m) is not None
@@ -452,7 +450,7 @@ def load_tau_mu_per_seed(seed_dirs, model, args):
                         break
 
         if taus is None:
-            mu_units = seed_utils.find_file_in_seed_dir(indir, f"{model}_mu_units.csv", model)
+            mu_units = seed_utils.find_dense_artifact_in_seed_dir(indir, f"{model}_mu_units", model)
             if mu_units is not None:
                 taus = estimate_tau_from_mu_units(mu_units, min_points=args.min_points,
                                                   mu_floor=args.mu_floor)

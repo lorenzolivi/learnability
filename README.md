@@ -46,8 +46,8 @@ SNR, sample complexity), and produces all figures in the paper.
 
 ```
 .
-├── run_learnability_DGX.py             # Training + diagnostics: ConstGate, SharedGate, DiagGate
-├── run_learnability_lstm_gru_DGX.py    # Training + diagnostics: LSTM, GRU
+├── run_learnability_baselines.py       # Training + diagnostics: ConstGate, SharedGate, DiagGate
+├── run_learnability_lstm_gru.py        # Training + diagnostics: LSTM, GRU
 ├── launch_multiseed.py                 # Wrapper for multi-seed runs across architectures
 ├── seed_utils.py                       # Shared utilities: seed discovery, CSV loading, aggregation
 ├── plot_all_multiseed.py               # Master runner for all 10 plot steps
@@ -60,19 +60,19 @@ SNR, sample complexity), and produces all figures in the paper.
 ├── plot_learnability_learning_curves.py# Training loss curves
 ├── fit_master_proportionality.py       # Master proportionality law fit
 ├── make_appendix_optimizer_figs.py     # Appendix: optimizer comparison figures
-├── plot_envelope_decomposition.py     # GELR envelope decomposition: f_gates(ℓ) and shape correction R(ℓ)
-├── launch_GELR_multiseed.sh           # Shell launcher for multi-seed GELR + decomposition runs
-├── EXAMPLES.txt                        # Full CLI examples and workflow documentation
+├── plot_envelope_decomposition.py      # GELR envelope decomposition: f_gates(ℓ) and shape correction R(ℓ)
+├── diagnostics/                        # Envelope-validation diagnostics and batch runners
 ├── requirements.txt
 └── README.md
 ```
 
-The two DGX scripts implement the full training and diagnostic pipeline,
-including first-order GELR envelope computation and optional envelope
-decomposition into gating ($f\_{\mathrm{gates}}$) and optimizer-adaptation
-($f\_{\mathrm{adapt}}$) components. The remaining scripts handle multi-seed
-orchestration and plotting with automatic aggregation across seeds and
-automatic merging of baselines and LSTM/GRU results.
+The two main training scripts implement the full training and diagnostic
+pipeline, including first-order GELR envelope computation and optional
+envelope decomposition into gating ($f\_{\mathrm{gates}}$) and
+optimizer-adaptation ($f\_{\mathrm{adapt}}$) components. The remaining
+scripts handle multi-seed orchestration and plotting with automatic
+aggregation across seeds and automatic merging of baseline and LSTM/GRU
+results.
 
 ---
 
@@ -91,11 +91,13 @@ fallback table is used with no loss of functionality.
 
 ## Hardware
 
-The training scripts are optimised for the
-[NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
-system. The full paper run (5 seeds × 5 architectures, 750 epochs each)
-requires a CUDA-capable GPU; a single DGX Spark run completes in roughly
-one day. Plotting and analysis scripts run on CPU.
+The codebase is not tied to a specific machine. The training scripts run on
+CPU, Apple Silicon via MPS, or CUDA GPUs through the `--device` flag.
+
+The full paper-scale configuration (5 seeds × 5 architectures, 750 epochs
+each, long sequences, and dense lag grids) is most practical on a
+DGX Spark-class CUDA machine or similar high-memory GPU system. Plotting and
+analysis scripts run on CPU.
 
 ---
 
@@ -132,6 +134,10 @@ python launch_multiseed.py \
   2>&1 | tee logs/launch_multiseed.log
 ```
 
+This example is suitable for a DGX Spark-class machine or a comparable CUDA
+system. On smaller hardware, reduce `T`, `H`, `Nseq_*`, `epochs`, and
+`batch_size`.
+
 ### Generating all figures
 
 Once training is complete, all figures can be generated in a single command:
@@ -149,11 +155,11 @@ results into unified figures. Selective plotting is supported via `--only` and
 
 ### Running individual experiments
 
-Each DGX script can also be run directly for a single seed:
+Each training script can also be run directly for a single seed:
 
 ```bash
 # Baselines (ConstGate, SharedGate, DiagGate)
-python run_learnability_DGX.py \
+python run_learnability_baselines.py \
   --outdir results/T1024/baselines/adamw_lagmax256/seed_212 \
   --models const,shared,diag --const_s 0.05 \
   --seed 212 --w_seed 212 \
@@ -163,7 +169,7 @@ python run_learnability_DGX.py \
   --device cuda
 
 # LSTM and GRU
-python run_learnability_lstm_gru_DGX.py \
+python run_learnability_lstm_gru.py \
   --outdir results/T1024/lstm_gru/adamw_lagmax256/seed_212 \
   --models lstm,gru \
   --seed 212 --w_seed 212 \
@@ -173,8 +179,13 @@ python run_learnability_lstm_gru_DGX.py \
   --device cuda
 ```
 
-See `EXAMPLES.txt` for the complete set of CLI options, per-plot examples,
-and additional workflow patterns.
+For the full CLI surface, run:
+
+```bash
+python launch_multiseed.py --help
+python run_learnability_baselines.py --help
+python run_learnability_lstm_gru.py --help
+```
 
 ### Outputs
 

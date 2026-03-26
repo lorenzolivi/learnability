@@ -563,7 +563,7 @@ def compute_approx_mu(model, intermediates, t_idx, ell):
         # For a single (t, ell): prod_f = prod(forget[t-ell+1 .. t])  (0-based: t-ell .. t-1)
         # Wait — let me be precise about indexing.
 
-        # In the pipeline code (run_learnability_lstm_gru_DGX.py):
+        # In the pipeline code (run_learnability_lstm_gru.py):
         #   prod_f = _win_prod_from_cs(cs_log_f, ell, ...) which computes
         #   exp(cs_log[:, ell+1:T+1, :] - cs_log[:, 1:T-ell+1, :])
         # This is the product of forget[t-ell .. t-1] for each output position.

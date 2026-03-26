@@ -10,9 +10,6 @@ dist/
 build/
 .pytest_cache/
 
-# Launcher
-*.sh
-
 # Folders
 latex/
 *results*/

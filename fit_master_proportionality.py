@@ -133,7 +133,7 @@ def find_envelope_fits_json(seed_dirs, inputdirs, json_name, outdir=None):
     Find envelope_fits.json, supporting:
       0. Combined file in outdir (written by plot_envelope.py in the same pipeline run)
       1. Combined file: seed_dir/envelope_fits.json (old format)
-      2. Per-model files: seed_dir/<model>/<model>_envelope_fits.json (DGX nested format)
+      2. Per-model files: seed_dir/<model>/<model>_envelope_fits.json (nested per-model format)
       3. Same searches in inputdirs as fallback
     Returns a dict (possibly reconstructed from per-model files).
     """
