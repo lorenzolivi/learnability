@@ -33,6 +33,41 @@ def save_args_to_csv(args, filepath: str) -> None:
         for k, v in vars(args).items():
             w.writerow([k, v])
 
+
+def _state_to_cpu(obj):
+    """Recursively move tensors in a nested checkpoint payload to CPU."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _state_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_state_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_state_to_cpu(v) for v in obj)
+    return obj
+
+
+def save_final_checkpoint(
+    outdir: str,
+    model_name: str,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    args,
+    u_vec: Optional[np.ndarray],
+) -> str:
+    """Save the final model/optimizer state needed for post-hoc diagnostics."""
+    ckpt_path = os.path.join(outdir, f"{model_name}_final_checkpoint.pt")
+    payload = {
+        "runner_type": "lstmgru",
+        "model_name": str(model_name),
+        "args": dict(vars(args)),
+        "u_vec": None if u_vec is None else np.asarray(u_vec, dtype=np.float32),
+        "model_state_dict": _state_to_cpu(model.state_dict()),
+        "optimizer_state_dict": _state_to_cpu(optimizer.state_dict()),
+    }
+    torch.save(payload, ckpt_path)
+    return ckpt_path
+
 def save_dense_unit_npz(
     filepath: str,
     ell_values: np.ndarray,
@@ -479,9 +514,9 @@ class _StableQuantileCache:
             out = tuple(float(x) for x in q)
         else:
             grid = self.fallback
-            al = grid[:, 0]
-            r = np.interp(a, al, grid[:, 1])
-            iqr = np.interp(a, al, grid[:, 2])
+            al = grid[::-1, 0]
+            r = np.interp(a, al, grid[::-1, 1])
+            iqr = np.interp(a, al, grid[::-1, 2])
             q25, q75 = -0.5 * iqr, 0.5 * iqr
             q95 = 0.5 * r * iqr
             q05 = -q95
@@ -577,27 +612,68 @@ def _choose_ecf_grid(samples: np.ndarray, n_points: int = 50) -> np.ndarray:
     return np.linspace(t_lo, t_hi, n_points)
 
 
-def estimate_alpha_sigma_ecf_symmetric(samples: np.ndarray) -> Tuple[float, float]:
+def _default_alpha_meta(method_requested: str, n_samples_total: int) -> Dict[str, object]:
+    """Default metadata payload for alpha-estimation diagnostics."""
+    return {
+        "method_requested": method_requested,
+        "method_origin": "none",
+        "method_reason": "not_run",
+        "reliability_reason": "not_run",
+        "alpha_hat": float("nan"),
+        "sigma_hat": float("nan"),
+        "reliable": False,
+        "n_samples_total": int(n_samples_total),
+        "n_samples_used": 0,
+        "used_subsample": 0,
+        "boundary_hit": 0,
+        "iqr": float("nan"),
+        "quantile_ratio": float("nan"),
+        "ecf_n_grid": 0,
+        "ecf_n_points_strict": 0,
+        "ecf_n_points_relaxed": 0,
+        "ecf_n_points_used": 0,
+        "ecf_filter_mode": "none",
+    }
+
+
+def estimate_alpha_sigma_ecf_symmetric_with_meta(samples: np.ndarray) -> Dict[str, object]:
     """
     Estimate (α̂, σ̂) for symmetric α-stable using ECF regression
     (Koutrouvelis 1980, simplified for β=0).
     """
+    samples = np.asarray(samples, dtype=np.float64)
     n = samples.size
+    meta = _default_alpha_meta("ecf", n)
     if n < _MIN_SAMPLES_ALPHA:
-        return 2.0, 0.0
+        meta["method_reason"] = "too_few_samples"
+        meta["reliability_reason"] = "too_few_samples"
+        return meta
 
     t_grid = _choose_ecf_grid(samples, n_points=50)
     phi2 = _ecf_at_t(samples, t_grid)
+    meta["ecf_n_grid"] = int(len(t_grid))
 
-    mask = (phi2 > 0.01) & (phi2 < 0.95)
-    if mask.sum() < 5:
-        mask = (phi2 > 1e-4) & (phi2 < 0.999)
-    if mask.sum() < 3:
-        q05, q25, q75, q95 = np.quantile(samples, [0.05, 0.25, 0.75, 0.95])
-        return estimate_alpha_sigma_mcculloch_symmetric_from_quantiles(q05, q25, q75, q95)
+    mask_strict = (phi2 > 0.01) & (phi2 < 0.95)
+    mask_relaxed = (phi2 > 1e-4) & (phi2 < 0.999)
+    n_strict = int(mask_strict.sum())
+    n_relaxed = int(mask_relaxed.sum())
+    meta["ecf_n_points_strict"] = n_strict
+    meta["ecf_n_points_relaxed"] = n_relaxed
+
+    if n_strict >= 5:
+        mask = mask_strict
+        meta["ecf_filter_mode"] = "strict"
+    elif n_relaxed >= 3:
+        mask = mask_relaxed
+        meta["ecf_filter_mode"] = "relaxed"
+    else:
+        meta["method_reason"] = "too_few_informative_points"
+        meta["reliability_reason"] = "too_few_informative_points"
+        return meta
 
     t_use = t_grid[mask]
     phi2_use = phi2[mask]
+    meta["ecf_n_points_used"] = int(mask.sum())
 
     Y = np.log(-np.log(phi2_use))
     X = np.log(t_use)
@@ -615,7 +691,104 @@ def estimate_alpha_sigma_ecf_symmetric(samples: np.ndarray) -> Tuple[float, floa
     alpha_hat = float(np.clip(alpha_hat, 1.0, 2.0))
     sigma_hat = float((np.exp(intercept) / 2.0) ** (1.0 / alpha_hat))
 
-    return alpha_hat, float(max(0.0, sigma_hat))
+    meta.update({
+        "method_origin": "ecf_regression",
+        "method_reason": "ok",
+        "reliability_reason": "ok",
+        "alpha_hat": alpha_hat,
+        "sigma_hat": float(max(0.0, sigma_hat)),
+    })
+    return meta
+
+
+def estimate_alpha_sigma_ecf_symmetric(samples: np.ndarray) -> Tuple[float, float]:
+    """Backward-compatible wrapper around the ECF estimator."""
+    meta = estimate_alpha_sigma_ecf_symmetric_with_meta(samples)
+    return float(meta["alpha_hat"]), float(meta["sigma_hat"])
+
+
+def estimate_alpha_sigma_with_meta(
+    samples: np.ndarray,
+    method: str = "ecf",
+    n_samples_for_ecf: int = 100000,
+) -> Dict[str, object]:
+    """Unified alpha-estimation interface with explicit provenance metadata."""
+    samples = np.asarray(samples, dtype=np.float64)
+    n = samples.size
+    meta = _default_alpha_meta(method, n)
+
+    iqr = float(np.subtract(*np.percentile(samples, [75, 25]))) if n > 0 else float("nan")
+    meta["iqr"] = iqr
+
+    if n < _MIN_SAMPLES_ALPHA:
+        meta["method_reason"] = "too_few_samples"
+        meta["reliability_reason"] = "too_few_samples"
+        return meta
+
+    if method == "ecf":
+        if n > n_samples_for_ecf:
+            rng = np.random.RandomState(42)
+            idx = rng.choice(n, n_samples_for_ecf, replace=False)
+            sub = np.asarray(samples[idx], dtype=np.float64)
+            meta["used_subsample"] = 1
+            meta["n_samples_used"] = int(sub.size)
+        else:
+            sub = np.asarray(samples, dtype=np.float64)
+            meta["n_samples_used"] = int(sub.size)
+
+        ecf_meta = estimate_alpha_sigma_ecf_symmetric_with_meta(sub)
+        for key in [
+            "method_origin",
+            "method_reason",
+            "alpha_hat",
+            "sigma_hat",
+            "ecf_n_grid",
+            "ecf_n_points_strict",
+            "ecf_n_points_relaxed",
+            "ecf_n_points_used",
+            "ecf_filter_mode",
+        ]:
+            meta[key] = ecf_meta[key]
+    else:
+        if (not np.isfinite(iqr)) or (iqr <= 1e-12):
+            meta["method_origin"] = "none"
+            meta["method_reason"] = "degenerate_iqr"
+            meta["reliability_reason"] = "degenerate_iqr"
+            meta["n_samples_used"] = int(n)
+            return meta
+
+        q05, q25, q75, q95 = np.quantile(samples, [0.05, 0.25, 0.75, 0.95])
+        meta["quantile_ratio"] = float((q95 - q05) / (iqr + 1e-12))
+        alpha_hat, sigma_hat = estimate_alpha_sigma_mcculloch_symmetric_from_quantiles(
+            q05, q25, q75, q95
+        )
+        meta.update({
+            "method_origin": "mcculloch",
+            "method_reason": "ok",
+            "alpha_hat": float(alpha_hat),
+            "sigma_hat": float(sigma_hat),
+            "n_samples_used": int(n),
+        })
+
+    reliability_reasons = []
+    alpha_hat = float(meta["alpha_hat"])
+    sigma_hat = float(meta["sigma_hat"])
+
+    if not np.isfinite(alpha_hat) or not np.isfinite(sigma_hat):
+        reliability_reasons.append(str(meta["method_reason"]))
+    if np.isfinite(sigma_hat) and sigma_hat <= 1e-12:
+        reliability_reasons.append("nonpositive_sigma")
+    if np.isfinite(alpha_hat) and (alpha_hat <= 1.01 or alpha_hat >= 1.99) and n < 2000:
+        reliability_reasons.append("boundary_with_few_samples")
+    if np.isfinite(iqr) and iqr <= 1e-10:
+        reliability_reasons.append("degenerate_iqr")
+
+    meta["boundary_hit"] = int(np.isfinite(alpha_hat) and (alpha_hat <= 1.01 or alpha_hat >= 1.99))
+    meta["reliable"] = len(reliability_reasons) == 0
+    meta["reliability_reason"] = (
+        "ok" if meta["reliable"] else ";".join(dict.fromkeys(reliability_reasons))
+    )
+    return meta
 
 
 def estimate_alpha_sigma(
@@ -624,40 +797,18 @@ def estimate_alpha_sigma(
     n_samples_for_ecf: int = 100000,
 ) -> Tuple[float, float, bool]:
     """Unified α̂ estimation with reliability checking."""
-    samples = np.asarray(samples, dtype=np.float64)
-    n = samples.size
-
-    if n < _MIN_SAMPLES_ALPHA:
-        return 2.0, 0.0, False
-
-    if method == "ecf":
-        if n > n_samples_for_ecf:
-            rng = np.random.RandomState(42)
-            idx = rng.choice(n, n_samples_for_ecf, replace=False)
-            sub = np.asarray(samples[idx], dtype=np.float64)
-        else:
-            sub = np.asarray(samples, dtype=np.float64)
-        alpha_hat, sigma_hat = estimate_alpha_sigma_ecf_symmetric(sub)
-    else:
-        q05, q25, q75, q95 = np.quantile(samples, [0.05, 0.25, 0.75, 0.95])
-        alpha_hat, sigma_hat = estimate_alpha_sigma_mcculloch_symmetric_from_quantiles(
-            q05, q25, q75, q95
-        )
-
-    reliable = True
-    if sigma_hat <= 1e-12:
-        reliable = False
-    if (alpha_hat <= 1.01 or alpha_hat >= 1.99) and n < 2000:
-        reliable = False
-    iqr = float(np.subtract(*np.percentile(samples, [75, 25])))
-    if iqr <= 1e-10:
-        reliable = False
-
-    return alpha_hat, sigma_hat, reliable
+    meta = estimate_alpha_sigma_with_meta(
+        samples,
+        method=method,
+        n_samples_for_ecf=n_samples_for_ecf,
+    )
+    return float(meta["alpha_hat"]), float(meta["sigma_hat"]), bool(meta["reliable"])
 
 
 def compute_snr(alpha_hat: float, sigma_hat: float, mbar_Tmean: float, Nuse: int) -> float:
     """Compute empirical SNR(ℓ, N) = |m̄(ℓ)| · N^{1-1/α} / σ̂."""
+    if (not np.isfinite(alpha_hat)) or (not np.isfinite(sigma_hat)) or (not np.isfinite(mbar_Tmean)):
+        return 0.0
     if sigma_hat <= 1e-12:
         return 0.0
     alpha_eff = max(1.0, float(alpha_hat))
@@ -1038,6 +1189,24 @@ def build_model(name: str, D: int, H: int, ln: bool,
     raise ValueError(f"Unknown model {name}")
 
 
+def make_optimizer(args, model: nn.Module) -> torch.optim.Optimizer:
+    """Construct the optimizer specified by CLI args for a given model."""
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "sgd":
+        return torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.0, weight_decay=args.weight_decay)
+    if args.optimizer == "sgd_momentum":
+        return torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    if args.optimizer == "rmsprop":
+        return torch.optim.RMSprop(
+            model.parameters(), lr=args.lr,
+            alpha=args.rmsprop_alpha,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
+    raise ValueError(f"Unknown optimizer {args.optimizer}")
+
+
 # ============================================================
 # Training (CPU→GPU streaming) + learning curve CSV
 #
@@ -1064,21 +1233,7 @@ def train_model(args, model: nn.Module,
 
     Returns the optimizer (needed for extracting adaptive base rates).
     """
-    if args.optimizer == "adamw":
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    elif args.optimizer == "sgd":
-        opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.0, weight_decay=args.weight_decay)
-    elif args.optimizer == "sgd_momentum":
-        opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-    elif args.optimizer == "rmsprop":
-        opt = torch.optim.RMSprop(
-            model.parameters(), lr=args.lr,
-            alpha=args.rmsprop_alpha,
-            momentum=args.momentum,
-            weight_decay=args.weight_decay,
-        )
-    else:
-        raise ValueError(f"Unknown optimizer {args.optimizer}")
+    opt = make_optimizer(args, model)
 
     Btot = int(Xtr_cpu.shape[0])
     bs = int(args.batch_size)
@@ -1487,6 +1642,9 @@ def run_for_model(args, model_name: str, mdir: str,
     opt, nan_halt = train_model(args, model, Xtr_cpu, Ytr_cpu, mdir, model_name, device=device, u_vec=u_vec)
     log(f"[run:{model_name}] train done  dt={now_s()-t_train0:.1f}s")
 
+    ckpt_path = save_final_checkpoint(mdir, model_name, model, opt, args, u_vec)
+    log(f"[diag:{model_name}] saved final checkpoint -> {ckpt_path}")
+
     if nan_halt:
         log(f"[diag:{model_name}] WARNING: training diverged (NaN halt). "
             f"Adaptive base rates will fall back to uniform lr={args.lr:.2e}. "
@@ -1740,10 +1898,18 @@ def run_for_model(args, model_name: str, mdir: str,
                 "f_gates", "f_ratio",
                 "lambda_mean", "lambda_std",
                 "alpha_ecf", "sigma_ecf", "alpha_ecf_reliable",
+                "alpha_ecf_origin", "alpha_ecf_reliability_reason",
+                "alpha_ecf_n_samples_used", "alpha_ecf_used_subsample",
+                "alpha_ecf_n_points_strict", "alpha_ecf_n_points_relaxed",
+                "alpha_ecf_n_points_used", "alpha_ecf_filter_mode",
                 "alpha_mcc", "sigma_mcc", "alpha_mcc_reliable",
+                "alpha_mcc_reliability_reason",
                 "alpha_mcc_ci_lo", "alpha_mcc_ci_hi",
-                "alpha_methods_agree",
+                "alpha_mcc_bootstrap_median", "alpha_mcc_ci_width",
+                "alpha_mcc_quantile_ratio", "alpha_mcc_iqr",
+                "alpha_methods_comparable", "alpha_methods_agree",
                 "alpha_hat", "sigma_hat", "alpha_reliable", "alpha_method_used",
+                "alpha_selection_reason",
                 "N_required_ecf", "best_snr_ecf", "err_at_best_snr_ecf", "best_N_ecf",
                 "N_required_mcc", "best_snr_mcc", "err_at_best_snr_mcc", "best_N_mcc",
                 "mbar_scalar", "n_samples", "n_sequences",
@@ -1791,24 +1957,33 @@ def run_for_model(args, model_name: str, mdir: str,
 
                 psi_seq_arr = np.concatenate(psi_seq_lists[ell]) if psi_seq_lists[ell] else np.array([], dtype=np.float64)
                 n_seq = len(psi_seq_arr)
+                mbar = float(abs(np.mean(psi_seq_arr))) if n_seq > 0 else 0.0
 
                 _run_ecf = "ecf" in args.alpha_methods
                 _run_mcc = "mcc" in args.alpha_methods
 
-                if n_seq == 0:
-                    alpha_ecf, sigma_ecf, rel_ecf = 2.0, 0.0, False
-                    alpha_mcc, sigma_mcc, rel_mcc = 2.0, 0.0, False
-                    mbar = 0.0
+                if _run_ecf:
+                    ecf_info = estimate_alpha_sigma_with_meta(psi_seq_arr, method="ecf")
                 else:
-                    if _run_ecf:
-                        alpha_ecf, sigma_ecf, rel_ecf = estimate_alpha_sigma(psi_seq_arr, method="ecf")
-                    else:
-                        alpha_ecf, sigma_ecf, rel_ecf = float("nan"), float("nan"), False
-                    if _run_mcc:
-                        alpha_mcc, sigma_mcc, rel_mcc = estimate_alpha_sigma(psi_seq_arr, method="mcculloch")
-                    else:
-                        alpha_mcc, sigma_mcc, rel_mcc = float("nan"), float("nan"), False
-                    mbar = float(abs(np.mean(psi_seq_arr)))
+                    ecf_info = _default_alpha_meta("ecf", n_seq)
+                    ecf_info["method_origin"] = "disabled"
+                    ecf_info["method_reason"] = "disabled"
+                    ecf_info["reliability_reason"] = "disabled"
+
+                if _run_mcc:
+                    mcc_info = estimate_alpha_sigma_with_meta(psi_seq_arr, method="mcculloch")
+                else:
+                    mcc_info = _default_alpha_meta("mcculloch", n_seq)
+                    mcc_info["method_origin"] = "disabled"
+                    mcc_info["method_reason"] = "disabled"
+                    mcc_info["reliability_reason"] = "disabled"
+
+                alpha_ecf = float(ecf_info["alpha_hat"])
+                sigma_ecf = float(ecf_info["sigma_hat"])
+                rel_ecf = bool(ecf_info["reliable"])
+                alpha_mcc = float(mcc_info["alpha_hat"])
+                sigma_mcc = float(mcc_info["sigma_hat"])
+                rel_mcc = bool(mcc_info["reliable"])
 
                 alpha_by_ell_ecf[ell] = float(alpha_ecf)
                 alpha_by_ell_mcc[ell] = float(alpha_mcc)
@@ -1852,7 +2027,7 @@ def run_for_model(args, model_name: str, mdir: str,
                 alpha_mcc_ci_lo = float("nan")
                 alpha_mcc_ci_hi = float("nan")
                 alpha_mcc_median = alpha_mcc  # default to point estimate
-                if _run_mcc and n_seq >= 4:
+                if _run_mcc and n_seq >= 4 and np.isfinite(alpha_mcc):
                     alpha_mcc_median, alpha_mcc_ci_lo, alpha_mcc_ci_hi, _ = bootstrap_mcculloch(
                         psi_seq_arr,
                         estimate_alpha_sigma_mcculloch_symmetric_from_quantiles,
@@ -1860,42 +2035,58 @@ def run_for_model(args, model_name: str, mdir: str,
                         ci=0.95
                     )
 
-                alpha_methods_agree = 0
-                if _run_ecf and _run_mcc and np.isfinite(alpha_ecf) and np.isfinite(alpha_mcc_ci_lo) and np.isfinite(alpha_mcc_ci_hi):
-                    if alpha_mcc_ci_lo <= alpha_ecf <= alpha_mcc_ci_hi:
-                        alpha_methods_agree = 1
-                elif not _run_ecf or not _run_mcc:
-                    alpha_methods_agree = 1
-
                 mcc_ci_width = (alpha_mcc_ci_hi - alpha_mcc_ci_lo) if (
                     np.isfinite(alpha_mcc_ci_lo) and np.isfinite(alpha_mcc_ci_hi)
                 ) else float("inf")
 
-                if _run_ecf and rel_ecf:
+                alpha_methods_comparable = int(
+                    _run_ecf and _run_mcc
+                    and str(ecf_info["method_origin"]) == "ecf_regression"
+                    and np.isfinite(alpha_ecf)
+                    and np.isfinite(alpha_mcc_ci_lo)
+                    and np.isfinite(alpha_mcc_ci_hi)
+                )
+                if alpha_methods_comparable:
+                    alpha_methods_agree = int(alpha_mcc_ci_lo <= alpha_ecf <= alpha_mcc_ci_hi)
+                else:
+                    alpha_methods_agree = -1
+
+                if _run_ecf and rel_ecf and str(ecf_info["method_origin"]) == "ecf_regression":
                     alpha_hat = alpha_ecf
                     sigma_hat_unified = sigma_ecf
                     alpha_reliable = True
                     alpha_method_used = "ecf"
-                elif _run_mcc and np.isfinite(alpha_mcc):
+                    alpha_selection_reason = "ecf_regression_reliable"
+                elif _run_mcc and np.isfinite(alpha_mcc_median):
                     alpha_hat = float(alpha_mcc_median)
                     sigma_hat_unified = sigma_mcc
                     alpha_reliable = bool(mcc_ci_width < 0.3)
                     alpha_method_used = "mcculloch"
+                    alpha_selection_reason = "mcculloch_available"
                 else:
                     alpha_hat = 2.0
                     sigma_hat_unified = 0.0
                     alpha_reliable = False
                     alpha_method_used = "none"
+                    alpha_selection_reason = "no_reliable_alpha_estimator"
 
                 wcsv.writerow([
                     int(ell), float(mu_mean), float(log_mu_mean),
                     float(f_gates_ell), float(f_ratio_ell),
                     float(lam_mean_ell), float(lam_std),
                     float(alpha_ecf), float(sigma_ecf), int(rel_ecf),
+                    ecf_info["method_origin"], ecf_info["reliability_reason"],
+                    int(ecf_info["n_samples_used"]), int(ecf_info["used_subsample"]),
+                    int(ecf_info["ecf_n_points_strict"]), int(ecf_info["ecf_n_points_relaxed"]),
+                    int(ecf_info["ecf_n_points_used"]), ecf_info["ecf_filter_mode"],
                     float(alpha_mcc), float(sigma_mcc), int(rel_mcc),
+                    mcc_info["reliability_reason"],
                     float(alpha_mcc_ci_lo), float(alpha_mcc_ci_hi),
-                    int(alpha_methods_agree),
+                    float(alpha_mcc_median), float(mcc_ci_width),
+                    float(mcc_info["quantile_ratio"]), float(mcc_info["iqr"]),
+                    int(alpha_methods_comparable), int(alpha_methods_agree),
                     float(alpha_hat), float(sigma_hat_unified), int(alpha_reliable), alpha_method_used,
+                    alpha_selection_reason,
                     int(N_req_ecf), float(best_snr_ecf_val), float(best_err_ecf), int(best_N_ecf if best_N_ecf is not None else -1),
                     int(N_req_mcc), float(best_snr_mcc_val), float(best_err_mcc), int(best_N_mcc if best_N_mcc is not None else -1),
                     float(mbar), n_seq * max(1, Tdg - ell), n_seq,

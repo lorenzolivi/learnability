@@ -14,12 +14,20 @@ build/
 latex/
 *results*/
 
-# Diagnostics: keep source/report, ignore generated artifacts
+# Diagnostics: keep selected source/report files, ignore generated artifacts
 diagnostics/*
-!diagnostics/*.py
-!diagnostics/*.md
-!diagnostics/*.sh
+!diagnostics/alpha_chain_seed_summary.md
+!diagnostics/alpha_estimator_validation_report.md
+!diagnostics/envelope_diagnostic_analysis.md
+!diagnostics/alpha_estimators_standalone.py
+!diagnostics/validate_alpha_estimators.py
+!diagnostics/diagnose_first_order_distortion.py
+!diagnostics/run_envelope_validation_batch.sh
+!diagnostics/run_alpha_chain.sh
+!diagnostics/diagnose_alpha_chain.py
 diagnostics/__pycache__/
+diagnostics/alpha_chain_pilot/
+diagnostics/alpha_estimator_validation/
 diagnostics/envelope_approx_validation/
 
 # Session handoff

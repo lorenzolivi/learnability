@@ -198,16 +198,19 @@ def plot_alpha_agreement_diagnostic(seed_dirs, plot_outdir):
         model_total_count = 0
 
         for seed_label, df in per_seed_traces:
-            # Filter for finite alpha values
+            # Filter for finite alpha values. If explicit comparability metadata is
+            # present, only compare genuinely independent ECF-vs-McC estimates.
             mask = (np.isfinite(df["alpha_ecf"].values) &
                     np.isfinite(df["alpha_mcc"].values))
+            if "alpha_methods_comparable" in df.columns:
+                mask &= (df["alpha_methods_comparable"].values.astype(int) == 1)
 
             if mask.sum() == 0:
                 continue
 
             ecf = df.loc[mask, "alpha_ecf"].values
             mcc = df.loc[mask, "alpha_mcc"].values
-            agree = df.loc[mask, "alpha_methods_agree"].values.astype(bool)
+            agree = (df.loc[mask, "alpha_methods_agree"].values.astype(int) == 1)
 
             all_ecf.extend(ecf)
             all_mcc.extend(mcc)

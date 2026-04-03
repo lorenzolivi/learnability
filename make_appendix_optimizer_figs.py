@@ -8,7 +8,7 @@ plotting utilities (replot_envelopes.py, replot_tau.py).
 
 Reads (per architecture, across seeds, if present):
   - <arch>_summary.csv     (needs columns: ell/lag and mu_l1_mean or mu_mean)
-  - <arch>_mu_units.npz    (preferred; falls back to legacy CSV)
+  - <arch>_mu_units.npz
 
 Aggregates mu_l1_mean across seeds on ell grid, optionally with ±1std band.
 Pools tau values across seeds for histograms.
@@ -200,7 +200,7 @@ def read_summary(path: str):
 
 def read_mu_units(path: str):
     """
-    Reads per-unit mu^{(q)}(ell) matrix from <arch>_mu_units.npz or legacy CSV.
+    Reads per-unit mu^{(q)}(ell) matrix from <arch>_mu_units.npz.
     Returns:
       ell: (L,)
       units: (L, H)
@@ -644,7 +644,7 @@ def main():
     if not archs:
         raise FileNotFoundError(
             f"No usable architectures found in seed dirs. "
-            "Need at least one pair: <arch>_summary.csv and <arch>_mu_units.(npz|csv)."
+            "Need at least one pair: <arch>_summary.csv and <arch>_mu_units.npz."
         )
 
     print(f"[info] detected architectures: {archs}")

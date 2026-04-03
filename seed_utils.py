@@ -143,7 +143,7 @@ def find_json_in_seed_dir(seed_dir: str, json_name: str, model: str = None) -> O
 
 def find_dense_artifact_in_seed_dir(seed_dir: str, stem: str, model: str = None) -> Optional[str]:
     """
-    Find a dense artifact stored as NPZ (preferred) or legacy CSV.
+    Find a dense artifact stored as NPZ.
 
     Args:
         seed_dir: Seed directory to search.
@@ -151,13 +151,9 @@ def find_dense_artifact_in_seed_dir(seed_dir: str, stem: str, model: str = None)
         model: Optional model subdirectory hint for nested layouts.
 
     Returns:
-        Path to <stem>.npz if present, otherwise <stem>.csv, else None.
+        Path to <stem>.npz if present, else None.
     """
-    for ext in (".npz", ".csv"):
-        path = find_file_in_seed_dir(seed_dir, f"{stem}{ext}", model)
-        if path is not None:
-            return path
-    return None
+    return find_file_in_seed_dir(seed_dir, f"{stem}.npz", model)
 
 
 def load_dense_unit_artifact(
@@ -165,15 +161,11 @@ def load_dense_unit_artifact(
     value_keys: Optional[list[str]] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Load a dense per-lag/per-unit artifact from NPZ or legacy CSV.
+    Load a dense per-lag/per-unit artifact from NPZ.
 
     NPZ files must contain:
       - ell:    (L,) lag grid
       - one value matrix, typically stored under "values"
-
-    Legacy CSV files are interpreted as:
-      - first column: ell/lag
-      - remaining columns: per-unit values
     """
     if value_keys is None:
         value_keys = [
@@ -185,24 +177,19 @@ def load_dense_unit_artifact(
             "first_order_values",
         ]
 
-    if path.endswith(".npz"):
-        with np.load(path, allow_pickle=False) as data:
-            if "ell" not in data:
-                raise ValueError(f"NPZ artifact missing 'ell' array: {path}")
-            value_key = next((k for k in value_keys if k in data), None)
-            if value_key is None:
-                raise ValueError(
-                    f"NPZ artifact missing a value matrix. Tried keys {value_keys} in {path}"
-                )
-            ell = np.asarray(data["ell"], dtype=np.float64)
-            values = np.asarray(data[value_key], dtype=np.float64)
-        return ell, values
+    if not path.endswith(".npz"):
+        raise ValueError(f"Dense artifacts must be NPZ, got: {path}")
 
-    df = pd.read_csv(path)
-    cols = {c.lower(): c for c in df.columns}
-    ell_col = cols.get("ell", cols.get("lag", cols.get("l", df.columns[0])))
-    ell = pd.to_numeric(df[ell_col], errors="coerce").to_numpy(dtype=np.float64)
-    values = df.drop(columns=[ell_col]).apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
+    with np.load(path, allow_pickle=False) as data:
+        if "ell" not in data:
+            raise ValueError(f"NPZ artifact missing 'ell' array: {path}")
+        value_key = next((k for k in value_keys if k in data), None)
+        if value_key is None:
+            raise ValueError(
+                f"NPZ artifact missing a value matrix. Tried keys {value_keys} in {path}"
+            )
+        ell = np.asarray(data["ell"], dtype=np.float64)
+        values = np.asarray(data[value_key], dtype=np.float64)
     return ell, values
 
 

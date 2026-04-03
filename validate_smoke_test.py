@@ -39,10 +39,18 @@ SUMMARY_EXPECTED_COLS = {
     "f_gates", "f_ratio",
     "lambda_mean", "lambda_std",
     "alpha_ecf", "sigma_ecf", "alpha_ecf_reliable",
+    "alpha_ecf_origin", "alpha_ecf_reliability_reason",
+    "alpha_ecf_n_samples_used", "alpha_ecf_used_subsample",
+    "alpha_ecf_n_points_strict", "alpha_ecf_n_points_relaxed",
+    "alpha_ecf_n_points_used", "alpha_ecf_filter_mode",
     "alpha_mcc", "sigma_mcc", "alpha_mcc_reliable",
+    "alpha_mcc_reliability_reason",
     "alpha_mcc_ci_lo", "alpha_mcc_ci_hi",
-    "alpha_methods_agree",
+    "alpha_mcc_bootstrap_median", "alpha_mcc_ci_width",
+    "alpha_mcc_quantile_ratio", "alpha_mcc_iqr",
+    "alpha_methods_comparable", "alpha_methods_agree",
     "alpha_hat", "sigma_hat", "alpha_reliable", "alpha_method_used",
+    "alpha_selection_reason",
     "N_required_ecf", "best_snr_ecf", "err_at_best_snr_ecf", "best_N_ecf",
     "N_required_mcc", "best_snr_mcc", "err_at_best_snr_mcc", "best_N_mcc",
     "mbar_scalar", "n_samples", "n_sequences",
@@ -244,7 +252,33 @@ def validate_model(model_dir, model_name):
         else:
             passes += 1
 
-    # 6) Check lambda_tau_correlation files (conditional on AdamW)
+        # 6) Check alpha_methods_comparable values are binary when present
+        issues = check_csv_values(
+            summary_path, "alpha_methods_comparable",
+            lambda vals: all(v in (0.0, 1.0) for v in vals),
+            "alpha_methods_comparable should be 0 or 1"
+        )
+        if issues:
+            fails += 1
+            for iss in issues:
+                messages.append(f"  VALUES {model_name}_summary.csv: {iss}")
+        else:
+            passes += 1
+
+        # 7) Check alpha_methods_agree uses {-1, 0, 1}
+        issues = check_csv_values(
+            summary_path, "alpha_methods_agree",
+            lambda vals: all(v in (-1.0, 0.0, 1.0) for v in vals),
+            "alpha_methods_agree should be -1, 0, or 1"
+        )
+        if issues:
+            fails += 1
+            for iss in issues:
+                messages.append(f"  VALUES {model_name}_summary.csv: {iss}")
+        else:
+            passes += 1
+
+    # 8) Check lambda_tau_correlation files (conditional on AdamW)
     lt_csv = os.path.join(model_dir, f"{model_name}_lambda_tau_correlation.csv")
     lt_json = os.path.join(model_dir, f"{model_name}_lambda_tau_stats.json")
 
@@ -367,7 +401,7 @@ def main():
     print("\n" + "=" * 60)
     if total_fail == 0:
         print(f"  ALL CHECKS PASSED ({total_pass} total)")
-        print("  Safe to launch full sweep: bash launch_GELR_multiseed.sh")
+        print("  Safe to launch full sweep: bash launch_learnability.sh")
     else:
         print(f"  {total_fail} CHECK(S) FAILED ({total_pass} passed)")
         print("  Fix issues before launching full sweep.")
