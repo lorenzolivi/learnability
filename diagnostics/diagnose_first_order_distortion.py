@@ -486,7 +486,7 @@ def compute_exact_jacobians(model, x_single):
             h_list.append(h_new.detach())
             h = h_new.detach()
 
-    # Now run a clean forward pass for predictions and delta
+    # Run a separate forward pass for predictions and delta.
     with torch.no_grad():
         y_hat_full, _, _ = model.forward_with_intermediates(x_single, return_intermediates=False)
 
@@ -556,24 +556,12 @@ def compute_approx_mu(model, intermediates, t_idx, ell):
         expr   = intermediates["expr"][0]     # (T, H)
         cdiag  = intermediates["cdiag"][0]    # (T, H)
 
-        # Zeroth order: e_t * prod_{j=t-ell+1}^{t} f_j
-        # But for LSTM the zeroth order is: expr[t] * prod(forget[t-ell+1..t])
-        # Actually the code computes:  mu0 = expr_end * prod_f
-        # where expr_end = expr[:, ell:Tdg, :] and prod_f is the windowed product
-        # For a single (t, ell): prod_f = prod(forget[t-ell+1 .. t])  (0-based: t-ell .. t-1)
-        # Wait — let me be precise about indexing.
-
-        # In the pipeline code (run_learnability_lstm_gru.py):
-        #   prod_f = _win_prod_from_cs(cs_log_f, ell, ...) which computes
-        #   exp(cs_log[:, ell+1:T+1, :] - cs_log[:, 1:T-ell+1, :])
-        # This is the product of forget[t-ell .. t-1] for each output position.
-        # For output position indexed by m (0-based), this is
-        #   prod(forget[m .. m+ell-1])
-        # The matched-stat convention aligns this so that output index m
-        # corresponds to step t = m + ell (0-based).
-
-        # For our single (t_idx, ell) pair:
-        # t_idx is 0-based. The product is over steps t-ell .. t-1 (0-based).
+        # Zeroth-order LSTM transport follows the cell path:
+        #   expr[t] * prod_{j=t-ell}^{t-1} forget[j]  (0-based indexing).
+        # This matches run_learnability_lstm_gru.py, where _win_prod_from_cs
+        # returns prod(forget[m:m+ell]) for output position m, corresponding
+        # to target time t = m + ell. For a single target index t_idx, the
+        # forget product is over t_idx-ell .. t_idx-1.
         start_j = t_idx - ell
         end_j = t_idx
 

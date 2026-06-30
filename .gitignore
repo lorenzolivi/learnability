@@ -30,9 +30,6 @@ diagnostics/alpha_chain_pilot/
 diagnostics/alpha_estimator_validation/
 diagnostics/envelope_approx_validation/
 
-# Session handoff
-SESSION_HANDOFF.md
-
 # Editor
 *.swp
 *.swo

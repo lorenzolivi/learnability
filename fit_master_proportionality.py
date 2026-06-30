@@ -157,8 +157,8 @@ def find_envelope_fits_json(seed_dirs, inputdirs, json_name, outdir=None):
             return load_json(path)
 
     # 2. Try per-model files and reconstruct combined dict.
-    #    Scan ALL seed dirs (not just the first with hits) to cover cases
-    #    where baselines/ has const/shared/diag and lstm_gru/ has gru/lstm.
+    #    Scan every seed dir so split input roots are both represented
+    #    (for example baselines/ plus lstm_gru/).
     combined = {}
     for sd in seed_dirs:
         for model in CANON_MODELS:
@@ -277,8 +277,6 @@ def main():
         else CANON_MODELS[:]
     )
 
-    is_multiseed = len(seed_dirs) > 1
-
     # Determine filename tag based on view mode.
     # The master fit is inherently seed-averaged, so it maps to "aggregated".
     # With --view both, we tag with "agg_" for consistency with other scripts.
@@ -326,8 +324,12 @@ def main():
                     print(f"[warn] {m} ({method}): could not load/aggregate summary CSVs; skipping")
                 continue
 
+            n_model_seeds = len(seed_dfs)
+            is_multiseed_model = n_model_seeds > 1
+
             if args.verbose:
                 print(f"\n[model {m}]  power-window=[{ell_min},{ell_max}]  beta={beta:.3g} r2={beta_r2:.3g}")
+                print(f"[info] {m} ({method}): contributing seed summaries = {n_model_seeds}")
 
             d = agg_data[["ell", "f_hat_mean", "alpha_hat_mean", "N_req_mean"]].copy()
             d.columns = ["ell", "f_hat", "alpha_hat", "N_req"]
@@ -372,7 +374,7 @@ def main():
             plt.scatter(d["x"].values, d["y"].values, s=80, alpha=0.7, zorder=3)
 
             # If multi-seed, also plot individual seed points (lighter)
-            if is_multiseed and seed_dfs:
+            if is_multiseed_model and seed_dfs:
                 for seed_df in seed_dfs:
                     # Apply same filters as aggregated data
                     seed_df = seed_df.dropna()
@@ -433,7 +435,7 @@ def main():
                 "f_col_used": args.f_col,
                 "alpha_col_used": alpha_col_used,
                 "N_col_used": nreq_col_used,
-                "n_seeds": len(seed_dirs),
+                "n_seeds": n_model_seeds,
             })
 
             if args.verbose:

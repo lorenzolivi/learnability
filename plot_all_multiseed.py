@@ -62,7 +62,7 @@ PLOT_STEPS = [
         "name": "tau",
         "label": "Tau distributions (CCDF)",
         "script": "plot_tau.py",
-        "extra_args": ["--ccdf", "--logx", "--logy"],
+        "extra_args": ["--ccdf", "--logx", "--logy", "--also_hist"],
     },
     {
         "name": "N_vs_envelope",
@@ -94,6 +94,18 @@ PLOT_STEPS = [
         "script": "fit_master_proportionality.py",
         "extra_args": [],
     },
+    {
+        "name": "per_projection_alpha",
+        "label": "Per-projection ECF tail-index diagnostic",
+        "script": "compute_per_projection_alpha.py",
+        "extra_args": [],
+    },
+    {
+        "name": "ecf_bootstrap_ci",
+        "label": "ECF bootstrap CIs for the projection-averaged alpha",
+        "script": "compute_ecf_bootstrap_ci.py",
+        "extra_args": ["--n_boot", "200"],
+    },
 ]
 
 
@@ -109,13 +121,13 @@ def parse_args():
         "--inputdirs",
         type=str,
         nargs="+",
-        required=True,
+        default=None,
         help="Input directories (e.g., baselines/adamw lstm_gru/adamw)",
     )
     p.add_argument(
         "--outdir",
         type=str,
-        required=True,
+        default=None,
         help="Base output directory for all plots",
     )
     p.add_argument(
@@ -159,6 +171,10 @@ def main():
         for step in PLOT_STEPS:
             print(f"  {step['name']:20s}  {step['label']}")
         sys.exit(0)
+
+    if not args.inputdirs or not args.outdir:
+        print("[error] --inputdirs and --outdir are required unless --list is used.", file=sys.stderr)
+        sys.exit(2)
 
     # Determine which steps to run
     skip_set = set(s.strip() for s in args.skip.split(",") if s.strip())

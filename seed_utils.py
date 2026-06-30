@@ -341,8 +341,7 @@ def aggregate_H_N_across_seeds(
     if not all_rows:
         return pd.DataFrame()
 
-    # Reconstruct from per-model H_N files
-    # This is more complex; for now return empty and let callers handle it
+    # Per-model reconstruction is handled by higher-level callers.
     return pd.DataFrame()
 
 

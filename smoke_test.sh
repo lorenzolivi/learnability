@@ -1,27 +1,43 @@
 #!/usr/bin/env bash
 # ════════════════════════════════════════════════════════════════════
-# GELR Smoke Test: single seed, AdamW only, all 5 architectures
+# Smoke Test: single seed, AdamW only, all 5 architectures
 #
-# Purpose: validate the current pipeline end to end before launching
-#          the next multi-seed pilot.
+# Purpose: validate the current pipeline end to end with the same
+#          task / statistical setup as launch_learnability.sh, but
+#          shrunk so it finishes on a laptop CPU overnight (or on a
+#          DGX GPU in minutes).
+#
+# Key principle: the task geometry (task_lags, task_coeffs, noise,
+# layernorm / orth_init, K projections, LSTM/GRU init, α estimation
+# settings) is IDENTICAL to launch_learnability.sh.  Only the scale
+# knobs that dominate wall time are reduced (Nseq, T, H, epochs,
+# num_lags, batch sizes, N_grid density, task lags capped at the
+# smaller T).
 #
 # What it runs:
 #   - seed 101, AdamW, baselines (const, shared, diag)
 #   - seed 101, AdamW, lstm + gru
 #
 # Output layout:
-#   results/GELR_smoke_test/baselines/seed_101/<model>/
-#   results/GELR_smoke_test/lstmgru/seed_101/<model>/
+#   results/smoke_test/baselines/seed_101/<model>/
+#   results/smoke_test/lstmgru/seed_101/<model>/
+#
+# Device:
+#   Auto-detects CUDA via torch.cuda.is_available(); otherwise falls
+#   back to CPU.  MPS is *not* used (incomplete torch.func.jvp support
+#   for recurrent kernels on Apple Silicon).  Override with DEVICE=…
+#     DEVICE=cpu  bash smoke_test.sh
+#     DEVICE=cuda bash smoke_test.sh
 #
 # Usage:
 #   bash smoke_test.sh
-#   bash smoke_test.sh && python validate_smoke_test.py
+#   bash smoke_test.sh && python validate_smoke_test.py --root results/smoke_test
 # ════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-SEED=101
-W_SEED=12345
-OUTROOT="results/GELR_smoke_test"
+SEED="${SEED:-101}"
+W_SEED="${W_SEED:-12345}"
+OUTROOT="${OUTROOT:-results/smoke_test}"
 LOGDIR="${OUTROOT}/logs"
 mkdir -p "$LOGDIR"
 
@@ -35,27 +51,66 @@ for RUNNER in "$BASE_RUNNER" "$RECURRENT_RUNNER"; do
   fi
 done
 
-# ── v2 parameters (same as full sweep) ──────────────────────────
-COMMON="--Nseq_train 8000 --Nseq_diag 12000 --T 2048 --D 16 --H 256 \
-  --epochs 750 --batch_size 512 --lr 0.001 --weight_decay 0.0001 \
-  --grad_clip 1.0 --lag_min 4 --lag_max 512 --num_lags 256 \
-  --task_lags 32,64,128,192,256,384,512 \
-  --task_coeffs 0.6,0.5,0.4,0.32,0.26,0.2,0.16 \
-  --noise_std 0.3 --eps 0.1 \
-  --N_grid 25,50,100,150,200,300,400,600,800,1200,1600,2400,3200,4800,6400,9600,12800,25600 \
+# ── Device auto-detect (CUDA if available, else CPU; never MPS) ─────
+DEVICE="${DEVICE:-}"
+if [[ -z "$DEVICE" ]]; then
+  if python - <<'PY' 2>/dev/null
+import sys, torch
+sys.exit(0 if torch.cuda.is_available() else 1)
+PY
+  then
+    DEVICE="cuda"
+  else
+    DEVICE="cpu"
+  fi
+fi
+echo "[info] device: ${DEVICE}"
+
+# ── Shared arguments ────────────────────────────────────────────────
+# Structurally mirrors launch_learnability.sh COMMON but scaled down:
+#   Nseq_train  8000 -> 1500
+#   Nseq_diag  12000 -> 2000
+#   T           1536 -> 512      (task_lags rescaled accordingly)
+#   H            256 -> 128
+#   epochs      1500 -> 200
+#   batch_size   384 -> 128
+#   num_lags     192 -> 64       (diagnostic grid density)
+#   lag_max      768 -> 256
+#   N_grid     54 pts ->  9 pts  (coarser sweep, same range shape)
+# All task/statistical knobs (task_coeffs, noise_std, noise_tolerance,
+# include_first_order_diag, orth_init, layernorm, alpha_methods,
+# alpha_n_boot, num_projections=50, const_s=0.05) match the paper run.
+COMMON="--Nseq_train 1500 --Nseq_diag 2000 --T 512 --D 16 --H 128 \
+  --epochs 200 --batch_size 128 --lr 0.0002 --weight_decay 0.0001 \
+  --grad_clip 1.0 --lag_min 4 --lag_max 256 --num_lags 64 \
+  --task_lags 32,64,96,128,192,256 \
+  --task_coeffs 0.60,0.50,0.40,0.30,0.22,0.16 \
+  --noise_std 0.4 --noise_tolerance 0.05 \
+  --N_grid 25,50,100,200,400,800,1200,1500 \
   --include_first_order_diag 1 --orth_init --layernorm \
   --log_gate_stats 1 --gate_log_every 10 \
-  --alpha_methods ecf,mcc --alpha_n_boot 500 --min_samples_alpha 1000 \
-  --device cuda"
+  --alpha_methods ecf,mcc --alpha_n_boot 500 --min_samples_alpha 500 \
+  --num_projections 50 \
+  --device ${DEVICE}"
 
-LSTM_EXTRA="--diag_batch_size 256 --diag_log_every 10"
+# diag_batch_size is much smaller on CPU; on CUDA it can be larger.
+if [[ "$DEVICE" == "cuda" ]]; then
+  LSTM_EXTRA="--diag_batch_size 256 --diag_log_every 10 --gru_init_update 0.05 --lstm_init_forget 0.5"
+else
+  LSTM_EXTRA="--diag_batch_size 64 --diag_log_every 10 --gru_init_update 0.05 --lstm_init_forget 0.5"
+fi
 
 T0=$SECONDS
 
 echo "═══════════════════════════════════════════════════════════"
-echo "  GELR Smoke Test — $(date)"
-echo "  Seed: ${SEED}, Optimizer: AdamW, Models: all 5"
-echo "  Params: T=2048, H=256, lag_max=512, num_lags=256"
+echo "  Smoke Test — $(date)"
+echo "  Device: ${DEVICE}"
+echo "  Seed: ${SEED} (w_seed base=${W_SEED}, 50 projections)"
+echo "  Optimizer: AdamW, Models: const,shared,diag,lstm,gru"
+echo "  Params: T=512, H=128, lag_max=256, num_lags=64"
+echo "  Scale: Nseq_train=1500, Nseq_diag=2000, epochs=200, batch=128"
+echo "  Projection aggregation: K=50 directions per w_seed base"
+echo "  LSTM init: lstm_init_forget=0.5, gru_init_update=0.05"
 echo "  Output: ${OUTROOT}"
 echo "═══════════════════════════════════════════════════════════"
 
@@ -67,7 +122,7 @@ python "$BASE_RUNNER" \
   --outdir "${OUTROOT}/baselines/seed_${SEED}" \
   --models const,shared,diag \
   --seed "$SEED" --w_seed "$W_SEED" \
-  --optimizer adamw --momentum 0.9 --const_s 0.1 \
+  --optimizer adamw --momentum 0.9 --const_s 0.05 \
   $COMMON \
   2>&1 | tee "${LOGDIR}/baselines_seed_${SEED}.log"
 
@@ -91,6 +146,7 @@ MINS=$(( (ELAPSED % 3600) / 60 ))
 echo ""
 echo "═══════════════════════════════════════════════════════════"
 echo "  Smoke test done — $(date)"
+echo "  Device: ${DEVICE}"
 echo "  Wall time: ${HOURS}h ${MINS}m"
 echo "  Output: ${OUTROOT}/"
 echo ""

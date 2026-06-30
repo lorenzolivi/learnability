@@ -112,14 +112,14 @@ def load_alpha_from_df(df: pd.DataFrame, method: str = "ecf", reliable_only: boo
         s = df[sigma_col].to_numpy(dtype=float)
         basic_mask &= np.isfinite(s) & (s > 0)
 
-    # Reliability column (new format from robust estimation)
+    # Method-specific reliability column, when available.
     if reliable_col in df.columns:
         rel_col = df[reliable_col].to_numpy()
         # Handle mixed types: could be int (0/1), bool, or string
         try:
             rel_flags = rel_col.astype(int)
         except (ValueError, TypeError):
-            rel_flags = np.ones(len(rel_col), dtype=int)  # assume reliable if unparseable
+            rel_flags = np.ones(len(rel_col), dtype=int)  # keep rows when legacy flags are unparseable
 
         reliable_mask = basic_mask & (rel_flags == 1)
         unreliable_mask = basic_mask & (rel_flags == 0)
@@ -416,7 +416,7 @@ def main():
             _add_gaussian_line(plt.gca())
             plt.xlabel(r"Estimated tail index $\hat\alpha(\ell)$")
             plt.ylabel("Density")
-            plt.title(rf"Distributions of $\hat\alpha(\ell)$ [aggregated, {method}]")
+            plt.title(rf"Distributions of $\hat\alpha(\ell)$ [{method.upper()}]")
             plt.legend(fontsize=8)
             plt.tight_layout()
             outpath = os.path.join(plot_outdir, f"{tag}alpha_hat_distributions{method_tag}.png")

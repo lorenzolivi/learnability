@@ -69,6 +69,11 @@ def parse_args():
     p.add_argument("--print_counts", action="store_true",
                    help="Print per-model τ counts (cleaned and after xmin cut)")
 
+    p.add_argument("--also_hist", action="store_true",
+                   help="Produce additional histogram overlay plots alongside main mode")
+    p.add_argument("--hist_bins", type=int, default=25,
+                   help="Number of bins for --also_hist plots (default: 25)")
+
     return p.parse_args()
 
 
@@ -390,6 +395,68 @@ def plot_overlay_ccdf(all_taus, title, outfile, args, n_seeds=None):
     print(f"[ok] saved: {outfile}")
 
 
+def plot_hist_separate_panels(all_taus, title, outdir_base, args, n_seeds=None):
+    """One histogram figure per model, saved as separate files."""
+    n_bins = int(args.hist_bins)
+
+    for model, tau_raw in all_taus.items():
+        tau_clean = _clean_tau(tau_raw, cap_percentile=float(args.cap_percentile))
+        if tau_clean.size < 2:
+            continue
+
+        color = seed_utils.get_model_color(model)
+        fig, ax = plt.subplots(figsize=(6.4, 4.2))
+        ax.hist(tau_clean, bins=n_bins, density=True, alpha=0.75,
+                color=color, edgecolor="black", linewidth=0.5)
+        ax.set_xlabel(r"$\tau_q$")
+        ax.set_ylabel("density")
+        ax.set_title(rf"{title} — {model}")
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass
+
+        outfile = os.path.join(outdir_base, f"tau_hist_{model}.png")
+        fig.savefig(outfile, dpi=300)
+        plt.close(fig)
+        print(f"[ok] saved: {outfile}")
+
+
+def plot_hist_per_seed_separate(all_taus_per_seed, title, outdir_base, args):
+    """Per-seed histograms: one figure per model, seeds overlaid within."""
+    n_bins = int(args.hist_bins)
+
+    for model, seed_traces in all_taus_per_seed.items():
+        color = seed_utils.get_model_color(model)
+        fig, ax = plt.subplots(figsize=(6.4, 4.2))
+
+        total_n = 0
+        n_seeds_used = 0
+        for i, (seed_label, tau_raw) in enumerate(seed_traces):
+            tau = _clean_tau(tau_raw, cap_percentile=float(args.cap_percentile))
+            if tau.size < 2:
+                continue
+            alpha_val = seed_utils.SEED_ALPHAS[i] if i < len(seed_utils.SEED_ALPHAS) else 0.3
+            ax.hist(tau, bins=n_bins, density=True, alpha=alpha_val * 0.55,
+                    color=color, edgecolor="black", linewidth=0.3)
+            total_n += tau.size
+            n_seeds_used += 1
+
+        ax.set_xlabel(r"$\tau_q$")
+        ax.set_ylabel("density")
+        ax.set_title(rf"{title} — {model} [per seed]")
+
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass
+
+        outfile = os.path.join(outdir_base, f"ps_tau_hist_{model}.png")
+        fig.savefig(outfile, dpi=300)
+        plt.close(fig)
+        print(f"[ok] saved: {outfile}")
+
+
 def plot_single_model_pdf(tau_raw, title, outfile, args):
     fig, ax = plt.subplots(figsize=(6.6, 4.3))
 
@@ -649,6 +716,22 @@ def main():
                                           title=r"Time-scale distribution $\tau_q$",
                                           outfile=os.path.join(plot_outdir, f"{ps_tag}tau_pdf_all.png"),
                                           args=args)
+
+    # ── ALSO_HIST: produce per-model histogram figures alongside main mode ──
+    if args.also_hist and not args.separate:
+        if view in ("aggregated", "both"):
+            if tau_mu_all:
+                plot_hist_separate_panels(tau_mu_all,
+                                          title=r"Time-scale distribution $\tau_q$",
+                                          outdir_base=plot_outdir,
+                                          args=args, n_seeds=n_seeds)
+
+        if view in ("per_seed", "both"):
+            if tau_mu_per_seed:
+                plot_hist_per_seed_separate(tau_mu_per_seed,
+                                            title=r"Time-scale distribution $\tau_q$",
+                                            outdir_base=plot_outdir,
+                                            args=args)
 
     # ── SEPARATE MODE (per-model figures, unchanged) ──
     if args.separate:

@@ -332,7 +332,7 @@ def main():
                 pct_label = f"{int(args.pct_lo)}th–{int(args.pct_hi)}th pctl"
                 ax.set_title(
                     r"Empirical learnability window $\widehat{\mathcal{H}}_N$"
-                    f" (median + {pct_label}) [aggregated, {method}]"
+                    f" (median + {pct_label}) [{method.upper()}]"
                 )
             elif args.hn_view == "boxplot":
                 plot_boxplot(ax, seed_dirs, present)
@@ -340,7 +340,7 @@ def main():
             ax.set_xlabel(r"Training budget $N$")
             ax.set_ylabel(r"$\widehat{\mathcal{H}}_N$")
             if args.hn_view not in ("percentile",):
-                ax.set_title(rf"Empirical learnability window $\widehat{{\mathcal{{H}}}}_N$ [aggregated, {method}]")
+                ax.set_title(rf"Empirical learnability window $\widehat{{\mathcal{{H}}}}_N$ [{method.upper()}]")
             ax.legend()
             fig.tight_layout()
 

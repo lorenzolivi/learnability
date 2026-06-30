@@ -2,218 +2,183 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2512.05790-b31b1b.svg)](https://arxiv.org/abs/2512.05790)
 
-Code accompanying the paper:
+Code accompanying:
 
 **Lorenzo Livi**
+
 *Learnability Window in Gated Recurrent Neural Networks*
+
 Paper: https://arxiv.org/abs/2512.05790
 
 ---
 
 ## Overview
 
-This repository contains the code for the experiments reported in the paper.
+This repository provides the code needed to reproduce the experimental
+results of the paper. The pipeline trains five recurrent architectures on a
+synthetic multi-lag regression task, restores the best-validation checkpoint,
+runs the diagnostics, and generates the aggregate figures and tables used in
+the manuscript.
 
-Classical analyses of gated RNNs focus on the numerical stability of Jacobian
-products, but stability alone does not guarantee that gradient signals are
-statistically recoverable from finite data. This work introduces the
-*learnability window* $H\_N$, defined as the maximal temporal horizon
-over which gradient information remains detectable at sample size $N$.
-Learnability is governed by the interaction between two quantities: the decay
-geometry of the Generalized Effective Learning Rate (GELR) envelope
-$f(\ell) = \lVert \mu\_{t,\ell} \rVert\_1$, where each neuron's rate
-$\mu^{(q)}\_{t,\ell} = \Lambda^{(q)}\_{r,\ell}\,\Gamma^{(q)}\_{t,\ell}$
-factorizes into an adaptive optimizer base rate and a gate-induced transport
-factor derived from a first-order expansion of the recurrent Jacobian product,
-and the concentration rate
-$N^{-1/\kappa\_\alpha}$ of stochastic gradients under heavy-tailed
-($\alpha$-stable) noise. The empirical learnability window is formulated via
-a signal-to-noise ratio (SNR) criterion derived from the Fano bound, yielding
-explicit scaling laws — logarithmic, polynomial, and exponential growth of
-$H\_N$ — that classify temporal learning regimes according to the attenuation
-of $f(\ell)$. Five gated architectures are compared empirically: ConstGate,
-SharedGate, DiagGate, GRU, and LSTM, with optimizer adaptation
-(e.g., AdamW preconditioning) treated as a co-equal factor alongside
-architecture in shaping the envelope decay.
-
-The pipeline trains each architecture on a synthetic multi-lag regression task,
-runs the full diagnostic suite (memory-kernel envelope, tail-index estimation,
-SNR, sample complexity), and produces all figures in the paper.
+The paper-scale runs are computationally heavy: they use long sequences, dense
+lag grids, five random seeds, and 50 random projection directions per seed. A
+smaller smoke test is included to validate the pipeline before launching the
+full simulations.
 
 ---
 
 ## Repository structure
 
-```
+```text
 .
-├── run_learnability_baselines.py       # Training + diagnostics: ConstGate, SharedGate, DiagGate
-├── run_learnability_lstm_gru.py        # Training + diagnostics: LSTM, GRU
-├── launch_multiseed.py                 # Wrapper for multi-seed runs across architectures
-├── seed_utils.py                       # Shared utilities: seed discovery, CSV loading, aggregation
-├── plot_all_multiseed.py               # Master runner for all 10 plot steps
-├── plot_empirical_learnability_win.py  # H_N curves (mean±std / percentile / boxplot)
-├── plot_envelope.py                    # Memory kernel envelope f(ℓ)
-├── plot_tau.py                         # Time-scale τ distributions
-├── plot_N_vs_envelope.py               # Sample complexity scaling
-├── plot_alpha_estimation.py            # α̂ distribution plots (with reliability filtering)
-├── plot_noise_floor.py                 # Noise floor / detectability threshold
-├── plot_learnability_learning_curves.py# Training loss curves
-├── fit_master_proportionality.py       # Master proportionality law fit
-├── make_appendix_optimizer_figs.py     # Appendix: optimizer comparison figures
-├── plot_envelope_decomposition.py      # GELR envelope decomposition: f_gates(ℓ) and shape correction R(ℓ)
-├── diagnostics/                        # Envelope-validation diagnostics and batch runners
+├── launch_learnability.sh               # Main launcher for paper-scale runs
+├── run_learnability_baselines.py        # ConstGate, SharedGate, DiagGate
+├── run_learnability_lstm_gru.py         # LSTM and GRU
+├── smoke_test.sh                        # Small end-to-end run
+├── validate_smoke_test.py               # Smoke-test validator
+├── plot_all_multiseed.py                # Master plotting/analysis runner
+├── plot_*.py                            # Individual plotting scripts
+├── compute_per_projection_alpha.py      # Per-projection alpha diagnostic
+├── compute_ecf_bootstrap_ci.py          # ECF bootstrap confidence intervals
+├── alpha_estimators.py                  # Standalone tail-index estimators
+├── fit_master_proportionality.py        # Master proportionality fit
+├── seed_utils.py                        # Shared loading/aggregation utilities
+├── diagnostics/                         # Additional diagnostic scripts
 ├── requirements.txt
 └── README.md
 ```
-
-The two main training scripts implement the full training and diagnostic
-pipeline, including first-order GELR envelope computation and optional
-envelope decomposition into gating ($f\_{\mathrm{gates}}$) and
-optimizer-adaptation ($f\_{\mathrm{adapt}}$) components. The remaining
-scripts handle multi-seed orchestration and plotting with automatic
-aggregation across seeds and automatic merging of baseline and LSTM/GRU
-results.
 
 ---
 
 ## Requirements
 
-```
+```bash
 pip install -r requirements.txt
 ```
 
-The code requires Python 3.9+ and depends on PyTorch, NumPy, Matplotlib,
-pandas, and (optionally) SciPy. SciPy is used for higher-accuracy McCulloch
-table construction via `scipy.stats.levy_stable`; if absent, a hardcoded
-fallback table is used with no loss of functionality.
+The code requires Python 3.9+ with PyTorch, NumPy, Matplotlib, pandas, and
+optionally SciPy.
 
 ---
 
 ## Hardware
 
-The codebase is not tied to a specific machine. The training scripts run on
-CPU, Apple Silicon via MPS, or CUDA GPUs through the `--device` flag.
+The scripts run on CPU or CUDA through the `--device` flag. The full
+paper-scale configuration is intended for a high-memory CUDA machine. Plotting
+and post-hoc analysis run on CPU.
 
-The full paper-scale configuration (5 seeds × 5 architectures, 750 epochs
-each, long sequences, and dense lag grids) is most practical on a
-DGX Spark-class CUDA machine or similar high-memory GPU system. Plotting and
-analysis scripts run on CPU.
+Apple Silicon MPS is not used by the provided launchers: `torch.func.jvp`
+support for recurrent kernels is incomplete on MPS, so the JVP-based
+matched-statistic pipeline should be run on CPU or CUDA.
 
 ---
 
 ## Reproducing the paper results
 
-### Full replication (5 seeds, as in the paper)
+The paper-scale outputs are grouped under `results/fullsim/`. The current
+five-seed configuration is:
 
-Training is launched via `launch_multiseed.py`, which orchestrates both the
-baseline script (ConstGate, SharedGate, DiagGate) and the LSTM/GRU script
-across all seeds. A typical invocation inside a tmux session:
-
-```bash
-tmux new -s learnability
-
-python launch_multiseed.py \
-  --seeds 212,1001,2002,3003,4004 \
-  --outdir_baselines results/T1024/baselines/adamw_lagmax256 \
-  --outdir_lstm_gru results/T1024/lstm_gru/adamw_lagmax256 \
-  --common_args "--Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
-    --optimizer adamw --momentum 0.9 --epochs 750 --batch_size 512 --lr 0.001 \
-    --weight_decay 0.0001 --grad_clip 1.0 \
-    --lag_min 4 --lag_max 256 --num_lags 128 \
-    --task_lags 32,64,128,192,256 --task_coeffs 0.6,0.5,0.4,0.32,0.26 \
-    --noise_std 0.3 \
-    --N_grid 25,50,100,150,200,300,400,600,800,1200,1600,2400,3200,4800,6400,9600,12800 \
-    --eps 0.1 --orth_init --layernorm \
-    --include_first_order_diag 1 --log_gate_stats 1 --gate_log_every 10 \
-    --device cuda \
-    --alpha_method ecf" \
-  --baseline_extra "--models const,shared,diag --const_s 0.05" \
-  --lstm_gru_extra "--models lstm,gru" \
-  --w_seed 212 \
-  --logdir logs \
-  2>&1 | tee logs/launch_multiseed.log
+```text
+2,12,31,41,51
 ```
 
-This example is suitable for a DGX Spark-class machine or a comparable CUDA
-system. On smaller hardware, reduce `T`, `H`, `Nseq_*`, `epochs`, and
-`batch_size`.
-
-### Generating all figures
-
-Once training is complete, all figures can be generated in a single command:
+Run the main-text AdamW experiment:
 
 ```bash
-python plot_all_multiseed.py \
-  --inputdirs results/T1024/baselines/adamw_lagmax256 results/T1024/lstm_gru/adamw_lagmax256 \
-  --outdir results/T1024/together/adamw_lagmax256
+bash launch_learnability.sh 2,12,31,41,51 main fullsim
 ```
 
-The plotting pipeline auto-discovers `seed_*` subdirectories, aggregates
-across seeds (mean ± std with shaded bands), and merges baseline and LSTM/GRU
-results into unified figures. Selective plotting is supported via `--only` and
-`--skip` flags; run `python plot_all_multiseed.py --list` to see available steps.
-
-### Running individual experiments
-
-Each training script can also be run directly for a single seed:
+Run the optimizer-comparison experiments:
 
 ```bash
-# Baselines (ConstGate, SharedGate, DiagGate)
-python run_learnability_baselines.py \
-  --outdir results/T1024/baselines/adamw_lagmax256/seed_212 \
-  --models const,shared,diag --const_s 0.05 \
-  --seed 212 --w_seed 212 \
-  --alpha_method ecf \
-  --Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
-  --optimizer adamw --epochs 750 --batch_size 512 --lr 0.001 \
-  --device cuda
-
-# LSTM and GRU
-python run_learnability_lstm_gru.py \
-  --outdir results/T1024/lstm_gru/adamw_lagmax256/seed_212 \
-  --models lstm,gru \
-  --seed 212 --w_seed 212 \
-  --alpha_method ecf \
-  --Nseq_train 8000 --Nseq_diag 8000 --T 1024 --D 16 --H 128 \
-  --optimizer adamw --epochs 750 --batch_size 512 --lr 0.001 \
-  --device cuda
+bash launch_learnability.sh 2,12,31,41,51 sgd fullsim
+bash launch_learnability.sh 2,12,31,41,51 rmsprop fullsim
 ```
 
-For the full CLI surface, run:
+This produces:
+
+```text
+results/fullsim/adamw/
+results/fullsim/sgd/
+results/fullsim/rmsprop/
+```
+
+The three optimizers can also be launched as one bundle:
 
 ```bash
-python launch_multiseed.py --help
-python run_learnability_baselines.py --help
-python run_learnability_lstm_gru.py --help
+bash launch_learnability.sh 2,12,31,41,51 publication fullsim
 ```
 
-### Outputs
+Running them one at a time is usually safer on shared machines because each
+optimizer sweep is long and writes separate logs.
 
-Each training run produces per-model CSV files (summary statistics, learning
-curves, per-unit envelope values, time-scale fits) and aggregate files
-(learnability window $H\_N$, CLI arguments for reproducibility). The plotting
-scripts produce PNG figures at 300 dpi.
+Launcher arguments:
+
+1. seed list, e.g. `2,12,31,41,51`
+2. run spec: `main`, `appendix`, `publication`, or a single optimizer name
+3. run name, used as `results/<run_name>/<optimizer>/...`
+4. optional `w_seed` policy; default is `auto`, which assigns disjoint blocks
+   of 50 projection directions per seed
 
 ---
 
-## Tail-index estimation
+## Smoke test
 
-Two methods are available for estimating the stable tail index $\hat{\alpha}$:
+Before a full run, validate the pipeline with:
 
-**McCulloch (1986)** (`--alpha_method mcculloch`, default): quantile-ratio
-method using four empirical quantiles. Fast but less statistically efficient.
+```bash
+bash smoke_test.sh
+python validate_smoke_test.py --root results/smoke_test
+```
 
-**Koutrouvelis (1980) ECF** (`--alpha_method ecf`): empirical characteristic
-function regression. For symmetric $\alpha$-stable distributions,
-$\log(-\log \lvert \hat{\varphi}(t) \rvert^2) = \log(2\sigma^\alpha) + \alpha \log \lvert t \rvert$;
-the slope gives $\hat{\alpha}$. More robust across the full $\alpha \in [1,2]$
-range.
+Optional device override:
 
-Both methods include reliability guards: minimum sample count, positive scale
-check, non-degenerate IQR, and boundary detection. Estimates are flagged via
-the `alpha_reliable` column in summary CSVs. The plotting script
-(`plot_alpha_estimation.py`) filters unreliable estimates by default; use
-`--show_unreliable` to overlay them.
+```bash
+DEVICE=cpu  bash smoke_test.sh
+DEVICE=cuda bash smoke_test.sh
+```
+
+---
+
+## Plotting and post-hoc analysis
+
+After training, generate aggregate figures and post-hoc alpha diagnostics with:
+
+```bash
+python plot_all_multiseed.py \
+  --inputdirs results/<run_name>/<optimizer>/baselines \
+              results/<run_name>/<optimizer>/lstmgru \
+  --outdir    results/<run_name>/<optimizer>/together
+```
+
+For example:
+
+```bash
+python plot_all_multiseed.py \
+  --inputdirs results/fullsim/sgd/baselines results/fullsim/sgd/lstmgru \
+  --outdir    results/fullsim/sgd/together
+```
+
+Available plotting steps:
+
+```bash
+python plot_all_multiseed.py --list
+```
+
+---
+
+## Outputs
+
+Each full run writes:
+
+- per-model CSV summaries, learning curves, envelope values, alpha estimates,
+  and time-scale fits;
+- selected checkpoint files and selection metadata;
+- per-projection matched-statistic arrays used by post-hoc alpha diagnostics;
+- aggregate plots and JSON/CSV summaries under each optimizer's `together/`
+  directory.
+
+Plotting scripts produce PNG figures at 300 dpi.
 
 ---
 
@@ -224,12 +189,10 @@ the `alpha_reliable` column in summary CSVs. The plotting script
   title={Learnability Window in Gated Recurrent Neural Networks},
   author={Livi, Lorenzo},
   journal={arXiv preprint arXiv:2512.05790},
-  year={2025},
-  doi={10.48550/arXiv.2512.05790},
-  url={https://arxiv.org/abs/2512.05790}
+  year={2025}
 }
 ```
 
 ## License
 
-This project is released under the MIT License. See [LICENSE](/Users/lorenzo/university/research/projects/dynamical_theory_learning/learnability/LICENSE).
+This project is released under the MIT License. See [LICENSE](LICENSE).

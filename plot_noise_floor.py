@@ -133,7 +133,7 @@ def load_summary(path: str, method: str = "ecf") -> pd.DataFrame:
     df = df.dropna(subset=["ell"])
     df["ell"] = df["ell"].astype(int)
 
-    # If duplicates exist, average them (robustness)
+    # Average duplicate lag rows before plotting.
     agg_cols = [c for c in agg_cols if c in df.columns]
     for c in agg_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -250,7 +250,7 @@ def _plot_envelope_eps_aggregated(summaries, ells, N_budgets, outpath, is_multis
     plt.yscale("log")
     plt.xlabel(r"lag $\ell$")
     plt.ylabel(r"Envelope / threshold level (log scale)")
-    plt.title(rf"Envelope $\hat f(\ell)$ and $\varepsilon_{{\mathrm{{th}}}}(\ell;N)$ [aggregated, {method}]")
+    plt.title(rf"Envelope $\hat f(\ell)$ and $\varepsilon_{{\mathrm{{th}}}}(\ell;N)$ [{method.upper()}]")
     plt.legend(fontsize=8, ncol=2)
     plt.tight_layout()
     plt.savefig(outpath, dpi=300)
@@ -283,7 +283,7 @@ def _plot_sigma_aggregated(summaries, ells, outpath, is_multiseed, method: str =
     plt.yscale("log")
     plt.xlabel(r"lag $\ell$")
     plt.ylabel(r"Estimated noise scale $\hat\sigma_\alpha(\ell)$ (log scale)")
-    plt.title(rf"Noise scale $\hat\sigma_\alpha(\ell)$ [aggregated, {method}]")
+    plt.title(rf"Noise scale $\hat\sigma_\alpha(\ell)$ [{method.upper()}]")
     plt.legend()
     plt.tight_layout()
     plt.savefig(outpath, dpi=300)

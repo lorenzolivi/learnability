@@ -47,6 +47,33 @@ def _state_to_cpu(obj):
     return obj
 
 
+def save_checkpoint(
+    outdir: str,
+    model_name: str,
+    checkpoint_tag: str,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    args,
+    u_vec: Optional[np.ndarray],
+    extra_payload: Optional[dict] = None,
+) -> str:
+    """Save a model/optimizer checkpoint needed for post-hoc diagnostics."""
+    ckpt_path = os.path.join(outdir, f"{model_name}_{checkpoint_tag}_checkpoint.pt")
+    payload = {
+        "runner_type": "lstmgru",
+        "model_name": str(model_name),
+        "checkpoint_tag": str(checkpoint_tag),
+        "args": dict(vars(args)),
+        "u_vec": None if u_vec is None else np.asarray(u_vec, dtype=np.float32),
+        "model_state_dict": _state_to_cpu(model.state_dict()),
+        "optimizer_state_dict": _state_to_cpu(optimizer.state_dict()),
+    }
+    if extra_payload:
+        payload.update(_state_to_cpu(extra_payload))
+    torch.save(payload, ckpt_path)
+    return ckpt_path
+
+
 def save_final_checkpoint(
     outdir: str,
     model_name: str,
@@ -54,19 +81,18 @@ def save_final_checkpoint(
     optimizer: torch.optim.Optimizer,
     args,
     u_vec: Optional[np.ndarray],
+    extra_payload: Optional[dict] = None,
 ) -> str:
-    """Save the final model/optimizer state needed for post-hoc diagnostics."""
-    ckpt_path = os.path.join(outdir, f"{model_name}_final_checkpoint.pt")
-    payload = {
-        "runner_type": "lstmgru",
-        "model_name": str(model_name),
-        "args": dict(vars(args)),
-        "u_vec": None if u_vec is None else np.asarray(u_vec, dtype=np.float32),
-        "model_state_dict": _state_to_cpu(model.state_dict()),
-        "optimizer_state_dict": _state_to_cpu(optimizer.state_dict()),
-    }
-    torch.save(payload, ckpt_path)
-    return ckpt_path
+    """Backward-compatible wrapper for the final checkpoint filename."""
+    return save_checkpoint(outdir, model_name, "final", model, optimizer, args, u_vec, extra_payload)
+
+
+def save_selection_metadata(outdir: str, model_name: str, payload: dict) -> str:
+    """Save a compact JSON summary of checkpoint selection and final-epoch metrics."""
+    path = os.path.join(outdir, f"{model_name}_selection.json")
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    return path
 
 def save_dense_unit_npz(
     filepath: str,
@@ -98,7 +124,7 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(int(seed))
 
 def layernorm_if(enabled: bool, dim: int) -> nn.Module:
-    """Return a LayerNorm module if enabled, otherwise nn.Identity (no-op)."""
+    """Return LayerNorm when enabled, otherwise an identity module."""
     return nn.LayerNorm(dim) if enabled else nn.Identity()
 
 def now_s() -> float:
@@ -1222,7 +1248,7 @@ def make_optimizer(args, model: nn.Module) -> torch.optim.Optimizer:
 def train_model(args, model: nn.Module,
                 Xtr_cpu: torch.Tensor, Ytr_cpu: torch.Tensor,
                 outdir: str, model_name: str, device: torch.device,
-                u_vec: Optional[np.ndarray]) -> None:
+                u_vec: Optional[np.ndarray]):
     """
     Train a GRU/LSTM model with streaming mini-batches (CPU→GPU).
 
@@ -1231,7 +1257,8 @@ def train_model(args, model: nn.Module,
     Optionally logs periodic gate statistics to gate_stats_<model>.csv.
     Halts early if NaN/Inf loss is detected.
 
-    Returns the optimizer (needed for extracting adaptive base rates).
+    Uses one fixed validation split for stable checkpoint selection and
+    returns the optimizer restored to the best validation epoch.
     """
     opt = make_optimizer(args, model)
 
@@ -1252,6 +1279,28 @@ def train_model(args, model: nn.Module,
         wlc = csv.writer(lf)
         # NOTE: train_acc / val_acc store R^2 (regression-friendly)
         wlc.writerow(["epoch", "train_loss", "train_acc", "val_loss", "val_acc"])
+
+    # Fixed validation split for stable checkpoint selection.
+    n_val = int(min(1024, max(bs, 256)))
+    Xv_cpu, Yv_cpu, _ = make_dataset_cpu(
+        n_val, args.T, args.D,
+        args.task_lags, args.task_coeffs, args.noise_std,
+        u_vec=u_vec
+    )
+    if device.type == "cuda":
+        Xv_cpu = Xv_cpu.pin_memory()
+        Yv_cpu = Yv_cpu.pin_memory()
+
+    best_val_mse = float("inf")
+    best_val_r2 = float("nan")
+    best_epoch = 0
+    best_model_state = None
+    best_optimizer_state = None
+    last_epoch = 0
+    last_train_loss = float("nan")
+    last_train_r2 = float("nan")
+    last_val_loss = float("nan")
+    last_val_r2 = float("nan")
 
     nan_halt = False
     for ep in range(args.epochs):
@@ -1302,23 +1351,24 @@ def train_model(args, model: nn.Module,
         Ytr_eval = Ytr_cpu[idx_eval]
         tr_mse_eval, tr_r2_eval = _eval_streaming_mse_and_r2(model, Xtr_eval, Ytr_eval, device=device, batch_size=bs)
 
-        # ---- validation: re-sample every epoch (no fixed validation set)
-        # Use same u_vec (task direction) to keep the task definition consistent.
-        n_val = int(min(1024, max(bs, 256)))
-        Xv_cpu, Yv_cpu, _ = make_dataset_cpu(
-            n_val, args.T, args.D,
-            args.task_lags, args.task_coeffs, args.noise_std,
-            u_vec=u_vec
-        )
-        if device.type == "cuda":
-            Xv_cpu = Xv_cpu.pin_memory()
-            Yv_cpu = Yv_cpu.pin_memory()
-
         va_mse, va_r2 = _eval_streaming_mse_and_r2(model, Xv_cpu, Yv_cpu, device=device, batch_size=bs)
+
+        if va_mse < best_val_mse:
+            best_val_mse = float(va_mse)
+            best_val_r2 = float(va_r2)
+            best_epoch = int(ep + 1)
+            best_model_state = _state_to_cpu(model.state_dict())
+            best_optimizer_state = _state_to_cpu(opt.state_dict())
 
         with open(lc_csv, "a", newline="") as lf:
             wlc = csv.writer(lf)
             wlc.writerow([ep + 1, float(train_loss_epoch), float(tr_r2_eval), float(va_mse), float(va_r2)])
+
+        last_epoch = int(ep + 1)
+        last_train_loss = float(train_loss_epoch)
+        last_train_r2 = float(tr_r2_eval)
+        last_val_loss = float(va_mse)
+        last_val_r2 = float(va_r2)
 
         if (ep == 0) or ((ep + 1) % every == 0) or (ep == args.epochs - 1):
             log(f"[train:{model_name}] epoch {ep+1}/{args.epochs} avg_loss={train_loss_epoch:.4g} "
@@ -1358,8 +1408,27 @@ def train_model(args, model: nn.Module,
 
     if nan_halt:
         log(f"[train:{model_name}] WARNING: training halted due to NaN/Inf loss")
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        opt.load_state_dict(best_optimizer_state)
+        if best_epoch != args.epochs:
+            log(
+                f"[train:{model_name}] restoring best validation checkpoint "
+                f"(epoch={best_epoch}, val_loss={best_val_mse:.4g}, val_R2={best_val_r2:.3f})"
+            )
     log(f"[train:{model_name}] done (nan_halt={nan_halt})")
-    return opt, nan_halt
+    return opt, nan_halt, {
+        "best_epoch": int(best_epoch),
+        "best_val_loss": float(best_val_mse),
+        "best_val_r2": float(best_val_r2),
+        "val_selection": "fixed_validation_split",
+        "n_val": int(n_val),
+        "last_epoch": int(last_epoch),
+        "last_train_loss": float(last_train_loss),
+        "last_train_r2": float(last_train_r2),
+        "last_val_loss": float(last_val_loss),
+        "last_val_r2": float(last_val_r2),
+    }
 
 
 # ============================================================
@@ -1639,11 +1708,32 @@ def run_for_model(args, model_name: str, mdir: str,
 
     log(f"[run:{model_name}] train start")
     t_train0 = now_s()
-    opt, nan_halt = train_model(args, model, Xtr_cpu, Ytr_cpu, mdir, model_name, device=device, u_vec=u_vec)
+    opt, nan_halt, train_meta = train_model(
+        args, model, Xtr_cpu, Ytr_cpu, mdir, model_name, device=device, u_vec=u_vec
+    )
     log(f"[run:{model_name}] train done  dt={now_s()-t_train0:.1f}s")
 
-    ckpt_path = save_final_checkpoint(mdir, model_name, model, opt, args, u_vec)
-    log(f"[diag:{model_name}] saved final checkpoint -> {ckpt_path}")
+    selected_ckpt_path = save_checkpoint(
+        mdir, model_name, "selected", model, opt, args, u_vec, extra_payload=train_meta
+    )
+    final_ckpt_path = save_final_checkpoint(
+        mdir, model_name, model, opt, args, u_vec, extra_payload=train_meta
+    )
+    selection_meta = dict(train_meta)
+    selection_meta.update({
+        "model_name": str(model_name),
+        "selected_checkpoint": os.path.basename(selected_ckpt_path),
+        "compat_final_checkpoint": os.path.basename(final_ckpt_path),
+        "selection_gap_val_loss": (
+            float(train_meta["last_val_loss"] - train_meta["best_val_loss"])
+            if np.isfinite(train_meta["last_val_loss"]) and np.isfinite(train_meta["best_val_loss"])
+            else float("nan")
+        ),
+    })
+    selection_meta_path = save_selection_metadata(mdir, model_name, selection_meta)
+    log(f"[diag:{model_name}] saved selected checkpoint -> {selected_ckpt_path}")
+    log(f"[diag:{model_name}] saved compatibility final checkpoint -> {final_ckpt_path}")
+    log(f"[diag:{model_name}] saved selection metadata -> {selection_meta_path}")
 
     if nan_halt:
         log(f"[diag:{model_name}] WARNING: training diverged (NaN halt). "
@@ -1692,6 +1782,13 @@ def run_for_model(args, model_name: str, mdir: str,
 
     # Per-sequence matched-statistic means ψ̄_n(ℓ).
     psi_seq_lists: Dict[int, list] = {ell: [] for ell in ells_list}
+    # Per-projection, per-sequence matched statistic means
+    #     psi_bar^{(n,k)}(ell) = (1/(T-ell)) * sum_t psi^{(n,k)}_{t,ell}
+    # stored as list of (Bb, K) arrays per batch; concatenated along
+    # axis 0 at the end to give a (N, K) matrix per lag.  Used only for
+    # post-hoc cross-projection diagnostics (K-convergence, UQ); downstream
+    # statistics still consume the K-averaged psi_seq_lists.
+    psi_seq_per_proj_lists: Dict[int, list] = {ell: [] for ell in ells_list}
 
     sum_mass: Dict[int, float] = {ell: 0.0 for ell in ells_list}
     sum_log_mass: Dict[int, float] = {ell: 0.0 for ell in ells_list}
@@ -1712,6 +1809,8 @@ def run_for_model(args, model_name: str, mdir: str,
     try:
         log(f"[run:{model_name}] diag stream start: Bdg={Bdg} T={Tdg} H={Hdim} num_lags={len(ells_list)}")
         log(f"[diag:{model_name}] orient_matched_statistic_sign={int(bool(args.orient_matched_statistic_sign))}")
+        log(f"[diag:{model_name}] num_projections K={int(max(1, int(args.num_projections)))} "
+            f"(w_seed base={int(args.w_seed)})")
         log(f"[diag:{model_name}] per-sequence means: {Bdg} sequences per lag")
         t_diag0 = now_s()
 
@@ -1734,8 +1833,6 @@ def run_for_model(args, model_name: str, mdir: str,
             with torch.no_grad():
                 yhat, hseq, g = model.forward_with_intermediates(xb)
 
-            vseq = compute_vseq_jvp(model, xb, w_seed=args.w_seed).detach()
-
             with torch.no_grad():
                 err = (yhat[..., 0] - yb[..., 0])  # (Bb,T)
                 delta = err.unsqueeze(-1) * Wout   # (Bb,T,H)
@@ -1752,6 +1849,9 @@ def run_for_model(args, model_name: str, mdir: str,
                     cdiag = g["cdiag"]
                     cs_log_f, cs_ratio = precompute_prefixes_lstm(forget, expr, cdiag)
 
+            # ----------------------------------------------------------
+            # Pass 1: envelope statistics (no projection dependence).
+            # ----------------------------------------------------------
             for ell in ells_list:
                 if ell <= 0 or ell >= Tdg:
                     continue
@@ -1767,25 +1867,8 @@ def run_for_model(args, model_name: str, mdir: str,
                             include_first_order=bool(args.include_first_order_diag),
                             out_dtype=torch.float64,
                         )
-                        mu_ms0, _, mu_ms = mu_for_matched_stat_gru(
-                            cs_log_leak,
-                            cs_log_reset,
-                            cs_log_eta,
-                            cs_ratio,
-                            ell,
-                            include_first_order=bool(args.include_first_order_diag),
-                            out_dtype=torch.float64,
-                        )
                     else:
                         mu_env0, mu_env1, mu_env = mu_for_envelope_lstm(
-                            cs_log_f,
-                            cs_ratio,
-                            expr,
-                            ell,
-                            include_first_order=bool(args.include_first_order_diag),
-                            out_dtype=torch.float64,
-                        )
-                        mu_ms0, _, mu_ms = mu_for_matched_stat_lstm(
                             cs_log_f,
                             cs_ratio,
                             expr,
@@ -1823,7 +1906,6 @@ def run_for_model(args, model_name: str, mdir: str,
                         mu_env0 = mu_env0 * fallback_env
                         mu_env1 = mu_env1 * fallback_env
 
-                with torch.no_grad():
                     if mu_env.numel() > 0:
                         abs_mu = torch.abs(mu_env).double()
                         abs_mu0 = torch.abs(mu_env0).double()
@@ -1836,7 +1918,67 @@ def run_for_model(args, model_name: str, mdir: str,
                         sum_unit_zero_order[ell] += abs_mu0.mean(dim=1).sum(dim=0).detach().cpu().numpy()
                         sum_unit_first_order[ell] += abs_mu1.mean(dim=1).sum(dim=0).detach().cpu().numpy()
 
+            # ----------------------------------------------------------
+            # Pass 2: matched statistic, aggregated over K random
+            # projections.  OPTIMISED LOOP ORDER: precompute all K
+            # JVPs (parked on CPU), then iterate ell-outer / k-inner
+            # so that the lag kernel (mu, rates, mu*delta) is built
+            # once per ell instead of K times.
+            #
+            # The per-sequence multi-projection output
+            #     psi_bar^{(n)}(ell, K) = (1/K) sum_k psi_bar^{(n,k)}(ell)
+            # matches the appendix definition of
+            # \widetilde{\bar S}^{(n)}_{ell,K}.
+            # ----------------------------------------------------------
+            K_proj = int(max(1, int(args.num_projections)))
+
+            # 2a. Precompute all K JVP sequences; store on CPU to keep
+            #     GPU memory free for the per-ell tensor work.
+            vseqs_cpu = []
+            for k_idx in range(K_proj):
+                w_seed_k = int(args.w_seed) + int(k_idx)
+                vk = compute_vseq_jvp(model, xb, w_seed=w_seed_k).detach()
+                vseqs_cpu.append(vk.cpu())
+                del vk
+            if device.type == "cuda" and args.cuda_sync:
+                torch.cuda.synchronize()
+
+            psi_seq_means_sum: Dict[int, Optional[np.ndarray]] = {
+                ell: None for ell in ells_list
+            }
+            # Per-projection per-sequence matched-statistic means for this
+            # batch: psi_bar^{(n,k)}(ell) stored in a (Bb, K) matrix per ell.
+            psi_seq_means_per_proj: Dict[int, Optional[np.ndarray]] = {
+                ell: None for ell in ells_list
+            }
+
+            # 2b. ell-outer loop: compute lag kernel once per ell,
+            #     then sweep the K projections in the inner loop.
+            for ell in ells_list:
+                if ell <= 0 or ell >= Tdg:
+                    continue
+
                 with torch.no_grad():
+                    if model_name == "gru":
+                        mu_ms0, _, mu_ms = mu_for_matched_stat_gru(
+                            cs_log_leak,
+                            cs_log_reset,
+                            cs_log_eta,
+                            cs_ratio,
+                            ell,
+                            include_first_order=bool(args.include_first_order_diag),
+                            out_dtype=torch.float64,
+                        )
+                    else:
+                        mu_ms0, _, mu_ms = mu_for_matched_stat_lstm(
+                            cs_log_f,
+                            cs_ratio,
+                            expr,
+                            ell,
+                            include_first_order=bool(args.include_first_order_diag),
+                            out_dtype=torch.float64,
+                        )
+
                     if use_lag_dependent and mu_ms.numel() > 0:
                         Lambda_ell_ms = compute_lag_dependent_rates(
                             lambda_matrix, hseq, mu_ms.shape[1], Lambda_q_fallback
@@ -1850,26 +1992,67 @@ def run_for_model(args, model_name: str, mdir: str,
                     if mu_used.numel() == 0:
                         continue
 
-                    delta_all = delta[:, ell:Tdg, :]             # (Bb,T-ell,H)
-                    v_past_all = vseq[:, 0:(Tdg - ell), :]       # (Bb,T-ell,H)
-                    psi = torch.sum(mu_used * delta_all * v_past_all, dim=2)  # (Bb,T-ell)
+                    # mu_delta = mu_used * delta_all depends only on ell;
+                    # precompute once, then the k-loop needs a single
+                    # element-wise multiply + sum.
+                    delta_ell = delta[:, ell:Tdg, :]              # (Bb, T-ell, H)
+                    mu_delta = mu_used * delta_ell
+                    del mu_used, delta_ell
 
-                    # Optional global sign convention per lag.
-                    if bool(args.orient_matched_statistic_sign):
-                        mu_psi = psi.mean()
-                        if torch.isfinite(mu_psi):
-                            sgn = torch.sign(mu_psi)
-                            if float(sgn.item()) == 0.0:
-                                sgn = torch.tensor(1.0, device=psi.device)
+                    for k_idx in range(K_proj):
+                        v_past_all = vseqs_cpu[k_idx][:, 0:(Tdg - ell), :].to(
+                            device, non_blocking=True
+                        )
+                        psi_k = torch.sum(mu_delta * v_past_all, dim=2)  # (Bb, T-ell)
+                        del v_past_all
+
+                        # Per-projection sign orientation: compute sign
+                        # from psi_k so that each projection is oriented
+                        # on its own before being averaged across k.
+                        if bool(args.orient_matched_statistic_sign):
+                            mu_psi = psi_k.mean()
+                            if torch.isfinite(mu_psi):
+                                sgn = torch.sign(mu_psi)
+                                if float(sgn.item()) == 0.0:
+                                    sgn = torch.tensor(1.0, device=psi_k.device)
+                            else:
+                                sgn = torch.tensor(1.0, device=psi_k.device)
+                            psi_k = sgn * psi_k
+
+                        # Per-sequence mean for projection k: psi_bar^{(n,k)}(ell).
+                        psi_seq_means_k = psi_k.mean(dim=1).detach().cpu().numpy().astype(np.float64)
+
+                        prev = psi_seq_means_sum[ell]
+                        if prev is None:
+                            psi_seq_means_sum[ell] = psi_seq_means_k
                         else:
-                            sgn = torch.tensor(1.0, device=psi.device)
-                        psi = sgn * psi
+                            psi_seq_means_sum[ell] = prev + psi_seq_means_k
 
-                    # Per-sequence means ψ̄_n(ℓ).
-                    psi_seq_means = psi.mean(dim=1).detach().cpu().numpy().astype(np.float64)  # (Bb,)
-                    psi_seq_lists[ell].append(psi_seq_means)
+                        # Stash per-projection means for post-hoc diagnostics.
+                        perK = psi_seq_means_per_proj[ell]
+                        if perK is None:
+                            perK = np.empty((psi_seq_means_k.shape[0], K_proj), dtype=np.float64)
+                            psi_seq_means_per_proj[ell] = perK
+                        perK[:, k_idx] = psi_seq_means_k
 
-            del xb, yb, yhat, hseq, g, vseq, err, delta
+                    del mu_delta
+
+            del vseqs_cpu
+            if device.type == "cuda" and args.cuda_sync:
+                torch.cuda.synchronize()
+
+            # Average per-sequence means over the K projections and
+            # append the aggregated psi_bar^{(n)}(ell, K).
+            for ell in ells_list:
+                acc = psi_seq_means_sum[ell]
+                if acc is None:
+                    continue
+                psi_seq_lists[ell].append(acc / float(K_proj))
+                perK = psi_seq_means_per_proj[ell]
+                if perK is not None:
+                    psi_seq_per_proj_lists[ell].append(perK)
+
+            del xb, yb, yhat, hseq, g, err, delta
             if device.type == "cuda" and args.cuda_sync:
                 torch.cuda.synchronize()
 
@@ -2131,6 +2314,73 @@ def run_for_model(args, model_name: str, mdir: str,
             rate_scale="base_lr",
         )
 
+        # Per-projection per-sequence matched statistic tensor:
+        # psi_per_proj[l, n, k] = psi_bar^{(n,k)}(ell_l).  Enables post-hoc
+        # K-convergence checks and free cross-projection UQ without affecting
+        # any downstream consumer (which uses the K-averaged psi_seq_lists).
+        K_proj_save = int(max(1, int(args.num_projections)))
+        if any(len(psi_seq_per_proj_lists[e]) > 0 for e in sorted_ells):
+            per_proj_blocks = []
+            valid = True
+            N_ref = None
+            for e in sorted_ells:
+                chunks = psi_seq_per_proj_lists[e]
+                if not chunks:
+                    valid = False
+                    break
+                arr = np.concatenate(chunks, axis=0)  # (N, K)
+                if N_ref is None:
+                    N_ref = arr.shape[0]
+                elif arr.shape[0] != N_ref:
+                    valid = False
+                    break
+                per_proj_blocks.append(arr)
+            if valid and N_ref is not None and per_proj_blocks:
+                psi_per_proj_arr = np.stack(per_proj_blocks, axis=0)  # (L, N, K)
+                psi_per_proj_path = os.path.join(mdir, f"{model_name}_psi_per_proj.npz")
+                np.savez_compressed(
+                    psi_per_proj_path,
+                    ell=ell_values,
+                    psi_per_proj=psi_per_proj_arr.astype(np.float64),
+                    num_projections=np.int64(K_proj_save),
+                    w_seed_base=np.int64(args.w_seed),
+                )
+                # Across-projection summary: mean_n psi_bar^{(n,k)}(ell)
+                # gives a K-vector per lag; std/|mean| of that vector
+                # quantifies residual Monte-Carlo error from the projection
+                # average.
+                proj_means = psi_per_proj_arr.mean(axis=1)  # (L, K)
+                across_mean = proj_means.mean(axis=1)
+                # Sign-agnostic per-lag UQ: mean_k | mean_n psi_bar^{(n,k)} |
+                # stays meaningful even when projections are not sign-oriented.
+                across_mean_abs = np.mean(np.abs(proj_means), axis=1)
+                if K_proj_save > 1:
+                    across_std = proj_means.std(axis=1, ddof=1)
+                else:
+                    across_std = np.zeros_like(across_mean)
+                sem = across_std / float(max(1, K_proj_save)) ** 0.5
+                summary_csv = os.path.join(mdir, f"{model_name}_psi_per_proj_summary.csv")
+                with open(summary_csv, "w", newline="") as fsum:
+                    wsum = csv.writer(fsum)
+                    wsum.writerow([
+                        "ell", "K", "N",
+                        "psi_mean_across_proj", "psi_mean_abs_across_proj",
+                        "psi_std_across_proj", "psi_sem_across_proj",
+                        "psi_rel_std_across_proj", "psi_rel_std_abs_across_proj",
+                    ])
+                    for i, e in enumerate(sorted_ells):
+                        m = float(across_mean[i])
+                        mabs = float(across_mean_abs[i])
+                        s = float(across_std[i])
+                        rel = float(s / abs(m)) if abs(m) > 1e-30 else float("nan")
+                        rel_abs = float(s / mabs) if mabs > 1e-30 else float("nan")
+                        wsum.writerow([
+                            e, K_proj_save, int(N_ref),
+                            m, mabs, s, float(sem[i]), rel, rel_abs,
+                        ])
+                log(f"[run:{model_name}] saved psi_per_proj npz "
+                    f"shape=(L={len(sorted_ells)}, N={N_ref}, K={K_proj_save})")
+
         # per-unit tau fits (always create outputs)
         tau_list = []
         tau_mu_results = []
@@ -2345,7 +2595,15 @@ def parse_args():
 
     # --- JVP / matched statistic ------------------------------------------------
     p.add_argument("--w_seed", type=int, default=12345,
-                   help="Seed for the random tangent direction w in JVP computation.")
+                   help="Base seed for the random tangent direction w in JVP computation.")
+    p.add_argument("--num_projections", type=int, default=1,
+                   help=(
+                       "Number of independent random tangent directions w_1,...,w_K "
+                       "to aggregate. For K>1, the K-th projection uses "
+                       "w_seed + (k-1) as its seed. The per-sequence matched "
+                       "statistic is averaged over the K projections. K=1 "
+                       "reproduces the single-projection baseline."
+                   ))
     p.add_argument("--include_first_order_diag", type=int, default=1,
                    help="If 1, include first-order correction in matched-stat kernel.")
 

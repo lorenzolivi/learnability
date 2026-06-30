@@ -4,7 +4,7 @@
 launch_multiseed.py — Wrapper to run the baseline and LSTM/GRU training
 scripts across multiple random seeds.
 
-Does NOT modify the training scripts. It simply calls them with different
+Does NOT modify the training scripts. It calls them with different
 --seed values, writing outputs to seed-tagged subdirectories:
     <outdir_baselines>/seed_<S>/
     <outdir_lstm_gru>/seed_<S>/
@@ -21,7 +21,7 @@ Usage:
         --logdir logs
 
 Each seed spawns two runs (baselines + lstm_gru) sequentially.
-Seeds are run sequentially by default, or in parallel with --parallel.
+Seeds are run sequentially.
 """
 
 import os
