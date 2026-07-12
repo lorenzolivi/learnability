@@ -61,6 +61,22 @@ import seed_utils
 # Subfolder for organizing output (relative to outdir)
 SUBFOLDER = "envelope"
 
+MODEL_LINESTYLES = {
+    "const": "-",
+    "shared": "--",
+    "diag": "-.",
+    "gru": ":",
+    "lstm": "-",
+}
+
+MODEL_MARKERS = {
+    "const": "o",
+    "shared": "s",
+    "diag": "^",
+    "gru": "D",
+    "lstm": "v",
+}
+
 
 # ------------------------------------------------------------
 # CLI
@@ -467,12 +483,24 @@ def plot_curves_aggregated(x: np.ndarray,
 
         is_single_seed = np.all((np.isnan(y_std) | (y_std == 0)))
         color = seed_utils.get_model_color(label)
+        line_style = MODEL_LINESTYLES.get(label, "-")
+        marker = MODEL_MARKERS.get(label, None)
+        markevery = max(1, int(mask.sum() // 12))
+        line_kwargs = {
+            "label": label,
+            "color": color,
+            "linestyle": line_style,
+            "marker": marker,
+            "markevery": markevery,
+            "markersize": 3.5,
+            "linewidth": 2.0,
+        }
 
         if is_single_seed:
-            plt.plot(x_[mask], y_mean[mask], "-", label=label, color=color)
+            plt.plot(x_[mask], y_mean[mask], **line_kwargs)
         else:
             seed_utils.shade_between(plt.gca(), x_[mask], y_mean[mask], y_std[mask],
-                                     label=label, color=color)
+                                     alpha=0.16, **line_kwargs)
 
         plotted = True
 

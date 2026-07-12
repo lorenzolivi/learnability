@@ -65,16 +65,6 @@ def parse_args():
     return p.parse_args()
 
 
-# ── Colours for consistent model styling ────────────────────────────────
-MODEL_COLORS = {
-    "const": "C0",
-    "shared": "C1",
-    "diag": "C2",
-    "gru": "C3",
-    "lstm": "C4",
-}
-
-
 def plot_mean_std(ax, agg, present, N_grid):
     """Original view: mean ± 1 std shaded band."""
     for label, (col, mean_col) in present.items():
@@ -96,7 +86,7 @@ def plot_mean_std(ax, agg, present, N_grid):
         y_plot = y_mean[mask]
         y_std_plot = y_std[mask] if not is_single_seed else np.zeros_like(y_plot)
 
-        c = MODEL_COLORS.get(label)
+        c = seed_utils.get_model_color(label)
         if is_single_seed:
             ax.plot(N_plot, y_plot, "o-", label=label, color=c)
         else:
@@ -119,7 +109,7 @@ def plot_percentile(ax, seed_dirs, present, pct_lo, pct_hi):
         if valid.sum() == 0:
             continue
 
-        c = MODEL_COLORS.get(label)
+        c = seed_utils.get_model_color(label)
         ax.plot(N_grid[valid], median[valid], "o-", label=label, color=c, markersize=4)
         ax.fill_between(
             N_grid[valid], lo[valid], hi[valid],
@@ -149,7 +139,7 @@ def plot_boxplot(ax, seed_dirs, present):
     positions_map = {n: i for i, n in enumerate(N_sorted)}
 
     for m_idx, (label, (N_grid, matrix)) in enumerate(model_matrices.items()):
-        c = MODEL_COLORS.get(label, f"C{m_idx}")
+        c = seed_utils.get_model_color(label)
         n_map = {n: j for j, n in enumerate(N_grid)}
 
         box_data = []

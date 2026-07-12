@@ -505,7 +505,10 @@ def shade_between(ax, x, y_mean, y_std, color=None, alpha=0.2, **kwargs):
     x, y_mean, y_std = x[mask], y_mean[mask], y_std[mask]
     y_std = np.where(np.isfinite(y_std), y_std, 0.0)
 
-    line = ax.plot(x, y_mean, **kwargs)
+    plot_kwargs = dict(kwargs)
+    if color is not None and "color" not in plot_kwargs:
+        plot_kwargs["color"] = color
+    line = ax.plot(x, y_mean, **plot_kwargs)
     c = color or line[0].get_color()
     ax.fill_between(x, y_mean - y_std, y_mean + y_std, alpha=alpha, color=c)
     return line
