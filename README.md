@@ -88,11 +88,10 @@ Run the main-text AdamW experiment:
 bash launch_learnability.sh 2,12,31,41,51 main fullsim
 ```
 
-Run the optimizer-comparison experiments:
+Run the optimizer-comparison experiment:
 
 ```bash
 bash launch_learnability.sh 2,12,31,41,51 sgd fullsim
-bash launch_learnability.sh 2,12,31,41,51 rmsprop fullsim
 ```
 
 This produces:
@@ -100,17 +99,10 @@ This produces:
 ```text
 results/fullsim/adamw/
 results/fullsim/sgd/
-results/fullsim/rmsprop/
 ```
 
-The three optimizers can also be launched as one bundle:
-
-```bash
-bash launch_learnability.sh 2,12,31,41,51 publication fullsim
-```
-
-Running them one at a time is usually safer on shared machines because each
-optimizer sweep is long and writes separate logs.
+Running the optimizer sweeps one at a time is usually safer on shared
+machines because each sweep is long and writes separate logs.
 
 Launcher arguments:
 
